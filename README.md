@@ -1,111 +1,139 @@
 # Storytel.pl-ADB
 
-A lightweight custom metadata provider for [Audiobookshelf](https://www.audiobookshelf.org/) that searches the **Polish Storytel catalog** and returns audiobook metadata in an Audiobookshelf-compatible format.
+Provider metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/) korzystający z publicznie dostępnego katalogu [Storytel Polska](https://www.storytel.com/pl).
 
-> **Documentation language:** English.
-> **Catalog and metadata:** Polish Storytel (`storytel.com/pl`).
+Projekt jest przeznaczony przede wszystkim do wyszukiwania **polskich wydań audiobooków** i pobierania ich metadanych bezpośrednio ze Storytel. Nie korzysta z katalogu Lubimyczytać ani nie zakłada zgodności ze strukturą jego wyszukiwarki.
 
-## How it works
+## Funkcje
 
-Storytel's search results are rendered by the browser, so a simple HTTP scraper is not reliable. This provider uses Playwright to load the real Storytel Poland search page, collect book URLs, open the individual book pages, and extract the metadata visible to users.
+- wyszukiwanie audiobooków po tytule;
+- opcjonalne dopasowanie autora;
+- wyszukiwanie bezpośrednio w polskim katalogu Storytel;
+- obsługa stron renderowanych po stronie klienta dzięki Playwright;
+- pobieranie metadanych potrzebnych Audiobookshelfowi;
+- tytuł, autor, lektor, wydawca, opis, okładka, ISBN, rok wydania, język, czas trwania, gatunki i seria;
+- ranking wyników na podstawie podobieństwa tytułu i autora;
+- prosty cache w pamięci ograniczający liczbę powtarzanych zapytań;
+- endpoint `/health` do sprawdzania stanu kontenera;
+- gotowe pliki Docker i Docker Compose.
+
+## Jak to działa
+
+Storytel Polska korzysta z aplikacji internetowej renderowanej przez JavaScript. Zwykłe pobranie strony HTTP nie zawsze zawiera wyniki wyszukiwania widoczne w przeglądarce.
+
+Dlatego provider korzysta z Playwright i prawdziwego silnika Chromium:
 
 ```text
 Audiobookshelf
-      |
-      | GET /search?query=...&author=...
-      v
-Storytel.pl-ADB
-      |
-      | Playwright / Chromium
-      v
+      │
+      ▼
+GET /search
+      │
+      ▼
 Storytel Polska
-      |
-      | search results + book pages
-      v
-Audiobookshelf-compatible metadata
+      │
+      ▼
+wyszukiwanie renderowane w Chromium
+      │
+      ▼
+strony książek /pl/books/...
+      │
+      ▼
+metadane książki
+      │
+      ▼
+format odpowiedzi Audiobookshelf
 ```
 
-The provider does **not** depend on the older Lubimyczytac implementation or on Storytel's internal API. The Polish Storytel website is the source of truth.
+Dzięki temu wyszukiwanie opiera się na tym samym katalogu, który jest dostępny użytkownikowi w przeglądarce Storytel Polska.
 
-## Features
+## Instalacja przez Docker
 
-- Searches the Polish Storytel catalog.
-- Searches by title with optional author matching.
-- Uses a real Chromium browser through Playwright.
-- Extracts metadata from Storytel book pages and structured data.
-- Returns Polish titles, descriptions, narrators and other Polish catalog metadata when available.
-- Extracts title, author, narrator, publisher, description, cover, ISBN, release year, language, duration, genres and series information.
-- Ranks results using title and author similarity.
-- Prefers Polish-language results when several candidates are available.
-- Uses a short in-memory cache to reduce repeated requests.
-- Provides Docker and Docker Compose deployment.
-- Includes a health endpoint for container monitoring.
-
-## Requirements
-
-- Docker
-- Docker Compose
-
-No local Python or Playwright installation is required when using Docker.
-
-## Running with Docker Compose
+Sklonuj repozytorium:
 
 ```bash
 git clone https://github.com/60plus/Storytel.pl-ADB.git
 cd Storytel.pl-ADB
+```
+
+Uruchom kontener:
+
+```bash
 docker compose up -d --build
 ```
 
-The provider listens on port `3000` by default.
+Domyślnie provider nasłuchuje na porcie `3000`.
 
-Check the container:
+Sprawdzenie kontenera:
 
 ```bash
 docker compose ps
 ```
 
-Check the health endpoint:
+Logi:
 
 ```bash
-curl http://127.0.0.1:3000/health
+docker compose logs -f
 ```
 
-Expected response:
-
-```json
-{"status":"ok"}
-```
-
-Stop the service:
+Zatrzymanie:
 
 ```bash
 docker compose down
 ```
 
+## Konfiguracja portu
+
+Port można zmienić za pomocą zmiennej środowiskowej `PORT`.
+
+Przykład:
+
+```yaml
+services:
+  storytel-pl-abs:
+    build: .
+    ports:
+      - "3000:3000"
+    environment:
+      PORT: 3000
+```
+
+## Integracja z Audiobookshelf
+
+W Audiobookshelf dodaj provider metadanych jako własny / niestandardowy provider zgodnie z konfiguracją używanej wersji Audiobookshelf.
+
+Adres providera powinien wskazywać na kontener lub host, na którym działa aplikacja, np.:
+
+```text
+http://adres-serwera:3000
+```
+
+Endpoint wyszukiwania providera:
+
+```text
+GET /search
+```
+
+Provider wymaga nagłówka `Authorization`. Wartość nagłówka nie jest obecnie używana do autoryzacji zewnętrznego konta Storytel — służy zgodności z interfejsem providera metadanych.
+
 ## API
 
 ### `GET /search`
 
-Search for a book in the Polish Storytel catalog.
+Parametry:
 
-Query parameters:
+- `query` — wymagany tytuł książki;
+- `author` — opcjonalny autor.
 
-| Parameter | Required | Description |
-|---|---|---|
-| `query` | Yes | Book title or search phrase |
-| `author` | No | Author name used to improve result ranking |
-
-The endpoint requires an `Authorization` header. The provider only checks that the header is present; authentication is normally handled by the reverse proxy or Audiobookshelf integration.
-
-Example:
+Przykład:
 
 ```bash
 curl -s \
   -H 'Authorization: test' \
-  'http://127.0.0.1:3000/search?query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
+  'http://localhost:3000/search?query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
 ```
 
-Example response:
+Przykładowa odpowiedź:
 
 ```json
 {
@@ -114,12 +142,12 @@ Example response:
       "title": "Wywyższenie Horusa",
       "author": "Dan Abnett",
       "narrator": "Filip Kosior",
-      "publisher": "Storytel",
+      "publisher": "Copernicus Corporation",
       "publishedYear": "2022",
       "description": "...",
       "cover": "https://covers.storytel.com/...",
-      "isbn": "...",
-      "genres": ["Science fiction"],
+      "isbn": "9788386758937",
+      "genres": ["Fantasy"],
       "series": [
         {
           "series": "Herezja Horusa",
@@ -135,65 +163,26 @@ Example response:
 }
 ```
 
-`duration` is returned in minutes, as expected by Audiobookshelf.
+`duration` jest zwracane w minutach, zgodnie z wymaganiami Audiobookshelf.
 
 ### `GET /health`
 
-Simple health check:
+Endpoint kontrolny:
 
-```http
-GET /health
+```bash
+curl http://localhost:3000/health
 ```
 
-Response:
+Odpowiedź:
 
 ```json
 {"status":"ok"}
 ```
 
-## Configuration
-
-Default settings:
-
-| Setting | Default |
-|---|---|
-| HTTP port | `3000` |
-| Storytel locale | `pl-PL` |
-| Time zone | `Europe/Warsaw` |
-| Cache lifetime | 10 minutes |
-| Maximum results | 10 |
-
-The application also exposes the `PORT` environment variable for deployments where another internal port is required.
-
-## Metadata source
-
-The provider is specifically designed for **Storytel Poland**:
-
-- Search: `https://www.storytel.com/pl/search/all`
-- Book pages: `https://www.storytel.com/pl/books/...`
-- Browser locale: `pl-PL`
-- Time zone: `Europe/Warsaw`
-
-The returned metadata therefore reflects the Polish Storytel catalog rather than a generic international Storytel catalog.
-
-## Why Playwright?
-
-Storytel's catalog is heavily client-rendered. The results visible in a normal browser are not necessarily present in the initial HTTP response.
-
-Playwright solves this by running Chromium and allowing Storytel's frontend to render normally. The scraper then:
-
-1. Opens the Polish Storytel search page.
-2. Waits for the client-rendered catalog.
-3. Collects links to book pages.
-4. Opens the relevant book pages.
-5. Reads structured data and page metadata.
-6. Normalizes the data for Audiobookshelf.
-7. Ranks the matches using title and author similarity.
-
-## Project structure
+## Struktura projektu
 
 ```text
-Storytel.pl-ADB/
+.
 ├── Dockerfile
 ├── compose.yml
 ├── requirements.txt
@@ -201,26 +190,26 @@ Storytel.pl-ADB/
 └── README.md
 ```
 
-## Development
+## Wymagania
 
-The application is a small FastAPI service. The main implementation is contained in `scraper.py`.
+Projekt korzysta z:
 
-For local development without Docker:
+- Python 3;
+- FastAPI;
+- Uvicorn;
+- Playwright;
+- Chromium dostarczanego przez obraz Playwright.
 
-```bash
-python -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-playwright install chromium
-uvicorn scraper:app --host 0.0.0.0 --port 3000
-```
+Wszystkie wymagane zależności są zdefiniowane w `requirements.txt`, a środowisko przeglądarkowe jest dostarczane przez obraz Docker używany w `Dockerfile`.
 
-## Maintenance
+## Dane i zakres działania
 
-Storytel may change its frontend, URLs, structured data or page layout. If the public website changes, the Playwright selectors or metadata extraction logic may need to be updated.
+Źródłem danych jest **Storytel Polska** (`storytel.com/pl`). Provider jest nastawiony na polski katalog i polskie wydania audiobooków.
 
-The project intentionally keeps the implementation focused on the public Polish Storytel website instead of depending on undocumented internal APIs.
+Projekt nie wymaga logowania do konta Storytel. Pobierane są informacje dostępne publicznie na stronach Storytel.
 
-## License
+Storytel może w przyszłości zmienić sposób działania swojej strony, strukturę HTML lub mechanizm wyszukiwania. W takim przypadku selektory i sposób ekstrakcji metadanych mogą wymagać aktualizacji.
 
-This project is provided as-is. It is an unofficial community project and is not affiliated with or endorsed by Storytel or Audiobookshelf.
+## Licencja
+
+Projekt jest udostępniony zgodnie z licencją znajdującą się w repozytorium. Dane i materiały pobierane ze Storytel pozostają własnością odpowiednich właścicieli praw.
