@@ -2,8 +2,7 @@
 
 Provider metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/) korzystający z publicznie dostępnego katalogu [Storytel Polska](https://www.storytel.com/pl).
 
-Projekt jest przeznaczony przede wszystkim do wyszukiwania **polskich wydań audiobooków** i pobierania ich metadanych bezpośrednio ze Storytel. Nie korzysta z katalogu Lubimyczytać ani nie zakłada zgodności ze strukturą jego wyszukiwarki.
-
+Projekt jest przeznaczony przede wszystkim do wyszukiwania **polskich wydań audiobooków** i pobierania ich metadanych bezpośrednio ze Storytel.
 ## Funkcje
 
 - wyszukiwanie audiobooków po tytule;
