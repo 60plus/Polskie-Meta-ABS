@@ -1,0 +1,7 @@
+services:
+  storytel-pl-adb:
+    build: .
+    container_name: storytel-pl-adb
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
