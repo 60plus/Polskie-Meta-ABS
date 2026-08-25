@@ -161,8 +161,15 @@ Przykładowa odpowiedź:
   ]
 }
 ```
-
 `duration` jest zwracane w minutach, zgodnie z wymaganiami Audiobookshelf.
+
+<img width="3840" height="1990" alt="Screenshot 2026-08-25 at 16-06-20 Audiobookshelf" src="https://github.com/user-attachments/assets/9e31944a-4cbd-4dc9-bfc2-5830e7e44726" />
+
+<img width="3840" height="1990" alt="Screenshot 2026-08-25 at 16-06-48 Audiobookshelf" src="https://github.com/user-attachments/assets/f6307bec-b89e-410e-a9f5-6d5a69aa6a2e" />
+
+
+
+
 
 ### `GET /health`
 
