@@ -209,7 +209,3 @@ Wszystkie wymagane zależności są zdefiniowane w `requirements.txt`, a środow
 Projekt nie wymaga logowania do konta Storytel. Pobierane są informacje dostępne publicznie na stronach Storytel.
 
 Storytel może w przyszłości zmienić sposób działania swojej strony, strukturę HTML lub mechanizm wyszukiwania. W takim przypadku selektory i sposób ekstrakcji metadanych mogą wymagać aktualizacji.
-
-## Licencja
-
-Projekt jest udostępniony zgodnie z licencją znajdującą się w repozytorium. Dane i materiały pobierane ze Storytel pozostają własnością odpowiednich właścicieli praw.
