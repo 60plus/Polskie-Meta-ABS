@@ -10,6 +10,7 @@ import httpx
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
+from playwright.async_api import async_playwright
 
 app = FastAPI(title="BookBeat Polska Metadata Provider")
 BASE = "https://www.bookbeat.com"
@@ -18,11 +19,15 @@ SEARCH = f"{PL}/search"
 CACHE_TTL = 600
 MAX_RESULTS = 10
 _http = None
+_browser = None
+_browser_context = None
+_browser_page = None
 _cache = {}
 _lock = asyncio.Lock()
+_browser_lock = asyncio.Lock()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
     "Upgrade-Insecure-Requests": "1",
@@ -168,17 +173,43 @@ async def fetch_html(url):
     return None
 
 
-async def warmup_bookbeat():
-    """Establish the same BookBeat session/cookies used by the search page."""
-    client = await get_http()
-    try:
-        response = await client.get(f"{PL}/", headers={"Referer": BASE + "/"})
-        response.raise_for_status()
-        print("[BookBeat] session warm-up: ok")
-        return True
-    except Exception as exc:
-        print(f"[BookBeat] session warm-up failed: {type(exc).__name__}: {exc}")
-        return False
+async def browser_search_page(query):
+    """Fallback for BookBeat's client-rendered search results.
+
+    The normal path stays on httpx. Playwright is used only when BookBeat
+    returns the empty application shell to the HTTP client.
+    """
+    global _browser, _browser_context, _browser_page
+    url = f"{SEARCH}?q={quote_plus(query)}&title={quote_plus(query)}"
+
+    async with _browser_lock:
+        try:
+            if _browser_page is None:
+                if _browser is None:
+                    pw = await async_playwright().start()
+                    _browser = pw.chromium
+                    _browser_context = await _browser.launch_persistent_context(
+                        user_data_dir="/tmp/bookbeat-playwright",
+                        headless=True,
+                        locale="pl-PL",
+                        user_agent=HEADERS["User-Agent"],
+                        viewport={"width": 1440, "height": 900},
+                    )
+                _browser_page = await _browser_context.new_page()
+
+            page = _browser_page
+            await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            try:
+                await page.locator("a[data-testid='book-card']").first.wait_for(timeout=7000)
+            except Exception:
+                pass
+            html = await page.content()
+            found = parse_search_html(html)
+            print(f"[BookBeat] browser search '{query}' -> {len(found)} book URLs")
+            return found
+        except Exception as exc:
+            print(f"[BookBeat] browser search failed: {type(exc).__name__}: {exc}")
+            return []
 
 
 def extract_book_urls(html):
@@ -203,7 +234,7 @@ def parse_search_html(html):
     found = []
     seen = set()
 
-    for link in soup.select("a[href*='/pl/book/']"):
+    for link in soup.select("a[data-testid='book-card'], a[href*='/pl/book/']"):
         href = canonical(urljoin(BASE, link.get("href") or ""))
         if not href or not is_book_url(href) or href in seen:
             continue
@@ -220,7 +251,7 @@ def parse_search_html(html):
                 break
 
         title = None
-        for selector in ("h1", "h2", "h3", "h4", "[data-testid='book-card-title']", "[data-testid*='title']"):
+        for selector in ("[data-testid='book-card-title']", "h1", "h2", "h3", "h4", "[data-testid*='title']"):
             node = card.select_one(selector)
             if node:
                 title = clean(node.get_text(" ", strip=True))
@@ -273,17 +304,10 @@ async def search_page(query):
             print(f"[BookBeat] search '{query}' -> {len(found)} book URLs")
             return found
 
-    # BookBeat sometimes returns a shell without the result cards to a fresh
-    # HTTP client. Reuse one session after loading /pl/ and retry the exact
-    # same search URL. This is a fallback only, so normal searches stay fast.
-    print(f"[BookBeat] search '{query}' -> 0 book URLs, retrying with warm session")
-    if await warmup_bookbeat():
-        html = await fetch_html(url)
-        if html:
-            found = parse_search_html(html)
-            if found:
-                print(f"[BookBeat] search '{query}' retry -> {len(found)} book URLs")
-                return found
+    print(f"[BookBeat] search '{query}' -> 0 book URLs, switching to browser fallback")
+    found = await browser_search_page(query)
+    if found:
+        return found
 
     print(f"[BookBeat] search '{query}' -> 0 book URLs")
     return []
@@ -447,7 +471,8 @@ async def bookbeat_search(query, author=""):
 
     result = {"matches": final}
     print("[BookBeat] final:", " | ".join(f"{x['title']}/{x['author']} [{x['similarity']:.3f}]" for x in final))
-    _cache[key] = (time.time(), result)
+    if final:
+        _cache[key] = (time.time(), result)
     return result
 
 
