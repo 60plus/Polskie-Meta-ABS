@@ -121,7 +121,6 @@ def value_after_label(lines, labels):
 
 
 # Backwards-compatible name used by lubimyczytac_patch.py.
-# Keep one implementation so the provider and patch cannot drift apart.
 def label_value(lines, labels):
     return value_after_label(lines, labels)
 
@@ -165,9 +164,10 @@ async def search_page(page, query, section):
     print(f"[Lubimyczytać] search: {url}")
     await open_page(page, url, 300)
 
-    # Exact card parsing: do not collect navigation links from the whole page.
-    cards = page.locator(".book-card--l")
     found, seen = [], set()
+
+    # Normal result cards. This is the preferred path.
+    cards = page.locator(".book-card--l")
     for i in range(await cards.count()):
         card = cards.nth(i)
         try:
@@ -177,7 +177,7 @@ async def search_page(page, query, section):
             href = await link.get_attribute("href") if await link.count() else None
             title_loc = card.locator(".book-card__title").first
             title = clean(await title_loc.text_content()) if await title_loc.count() else None
-            if not href or not title:
+            if not href:
                 continue
             href = href if href.startswith("http") else f"{BASE}{href}"
             href = canonical(href)
@@ -185,7 +185,60 @@ async def search_page(page, query, section):
                 continue
             authors = [clean(x) for x in await card.locator(".book-card__author a, a[href*='/autor/']").all_text_contents() if clean(x)]
             seen.add(href)
-            found.append({"url": href, "title": title, "authors": list(dict.fromkeys(authors)), "type": path_type(href)})
+            found.append({
+                "url": href,
+                "title": title or url_title(href),
+                "authors": list(dict.fromkeys(authors)),
+                "type": path_type(href),
+            })
+        except Exception:
+            continue
+
+    # LC currently renders some audiobook search results without the
+    # .book-card--l wrapper. Do not lose them: collect only real product links
+    # and derive the title from the surrounding result element / URL.
+    product_links = page.locator("a[href*='/audiobook/'], a[href*='/ksiazka/']")
+    for i in range(await product_links.count()):
+        link = product_links.nth(i)
+        try:
+            href = await link.get_attribute("href")
+            if not href:
+                continue
+            href = href if href.startswith("http") else f"{BASE}{href}"
+            href = canonical(href)
+            if not is_product_url(href) or href in seen:
+                continue
+
+            title = clean(await link.text_content())
+            authors = []
+
+            # Try the nearest result/card-like ancestor first. The exact
+            # wrapper changed on LC, therefore use several safe ancestor forms.
+            ancestor = link.locator(
+                "xpath=ancestor::*[self::article or self::li or contains(@class,'book-card') or contains(@class,'search-result')][1]"
+            ).first
+            if await ancestor.count():
+                title_loc = ancestor.locator(".book-card__title, a[href*='/audiobook/'], a[href*='/ksiazka/']").first
+                if await title_loc.count():
+                    ancestor_title = clean(await title_loc.text_content())
+                    if ancestor_title:
+                        title = ancestor_title
+                authors = [
+                    clean(x)
+                    for x in await ancestor.locator(".book-card__author a, a[href*='/autor/']").all_text_contents()
+                    if clean(x)
+                ]
+
+            if not title or len(title) > 180:
+                title = url_title(href)
+
+            seen.add(href)
+            found.append({
+                "url": href,
+                "title": title,
+                "authors": list(dict.fromkeys(authors)),
+                "type": path_type(href),
+            })
         except Exception:
             continue
 
@@ -233,6 +286,15 @@ async def parse_detail(page, candidate):
         if not name:
             continue
         s = similarity(name, current_title)
+        item_url = str(item.get("url") or "")
+        if item_url and urlparse(item_url).path.rstrip("/") == urlparse(url).path.rstrip("/"):
+            s += 2.0
+        types = item.get("@type")
+        type_text = " ".join(types) if isinstance(types, list) else str(types or "")
+        if item_type == "audiobook" and re.search(r"audiobook|audio", type_text, re.I):
+            s += 0.25
+        if item_type == "book" and re.search(r"book", type_text, re.I):
+            s += 0.10
         if s > best:
             target, best = item, s
 
@@ -277,6 +339,7 @@ async def parse_detail(page, candidate):
         "meta[name='twitter:image']",
         "meta[itemprop='image']",
         "img.book-cover[src]",
+        "img[src*='lubimyczytac']",
     ):
         try:
             loc = page.locator(selector).first
@@ -292,7 +355,7 @@ async def parse_detail(page, candidate):
             pass
 
     detail_authors = []
-    for selector in ("a.book__author", ".book__authors a[href*='/autor/']"):
+    for selector in ("a.book__author", ".book__authors a[href*='/autor/']", "a[href*='/autor/']"):
         try:
             detail_authors += [clean(x) for x in await page.locator(selector).all_text_contents() if clean(x)]
         except Exception:
@@ -300,14 +363,14 @@ async def parse_detail(page, candidate):
     if detail_authors:
         data["author"] = ", ".join(dict.fromkeys(detail_authors[:5]))
 
-    data["publisher"] = data["publisher"] or label_value(lines, ["Wydawca", "Wydawnictwo"])
-    data["publishedYear"] = data["publishedYear"] or parse_year(label_value(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
-    data["isbn"] = data["isbn"] or label_value(lines, ["ISBN"])
-    data["duration"] = data["duration"] or parse_duration(label_value(lines, ["Czas czytania", "Długość", "Czas trwania"]))
-    data["narrator"] = label_value(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"]) or data["narrator"]
-    language = label_value(lines, ["Język"])
+    data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
+    data["publishedYear"] = data["publishedYear"] or parse_year(value_after_label(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
+    data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
+    data["duration"] = data["duration"] or parse_duration(value_after_label(lines, ["Czas czytania", "Długość", "Czas trwania"]))
+    data["narrator"] = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"]) or data["narrator"]
+    language = value_after_label(lines, ["Język"])
     data["language"] = "pol" if not language or norm(language) in {"polski", "polska", "pol"} else norm(language)
-    category = label_value(lines, ["Kategoria", "Kategorie"])
+    category = value_after_label(lines, ["Kategoria", "Kategorie"])
     if category:
         data["genres"] = [clean(x) for x in re.split(r"[,;/]", category) if clean(x)]
     data["series"], data["sequence"] = series_from_lines(lines)
