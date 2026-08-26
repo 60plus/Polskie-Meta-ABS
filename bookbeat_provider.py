@@ -285,18 +285,7 @@ async def search_page(query):
     return []
 
 
-def first_text(root, selectors):
-    for selector in selectors:
-        node = root.select_one(selector)
-        if node:
-            value = clean(node.get_text(" ", strip=True))
-            if value:
-                return value
-    return None
-
-
 def labeled_metadata(soup):
-    """Read BookBeat's secondary metadata by its accessible label."""
     result = {}
     labels = (
         "Oryginalny rok publikacji",
@@ -311,9 +300,6 @@ def labeled_metadata(soup):
     for label in labels:
         nodes = soup.find_all(attrs={"aria-label": label})
         for node in nodes:
-            # BookBeat uses a label <p> followed by the value <p> in the same
-            # metadata block. Keep the lookup local so another field cannot
-            # accidentally become the value.
             value_node = node.find_next_sibling()
             if not value_node:
                 parent = node.parent
@@ -369,8 +355,6 @@ def narrator_from_bookbeat(soup, description):
 
 def genres_from_bookbeat(soup):
     values = []
-    # Current BookBeat markup exposes this block as a <p aria-label="Kategorie">
-    # followed by a container with category links. Do not depend on CSS hashes.
     for node in soup.find_all(attrs={"aria-label": "Kategorie"}):
         parent = node.parent
         container = parent if parent else node
@@ -383,7 +367,6 @@ def genres_from_bookbeat(soup):
                 value = clean(link.get_text(" ", strip=True))
                 if value:
                     values.append(value)
-    # Fallback for pages where only the visible text is present.
     if not values:
         for node in soup.find_all(string=lambda s: isinstance(s, str) and clean(s) == "Kategorie:"):
             parent = node.parent
@@ -467,16 +450,29 @@ def parse_detail(html, candidate):
         data["author"] = ", ".join(dict.fromkeys(x for x in authors if x)) or None
 
     data["narrator"] = narrator_from_bookbeat(soup, description)
-    data["publisher"] = meta.get("Wydawca audiobooka") or data["publisher"]
-    # Audiobookshelf exposes only a year here. For an audiobook result the
-    # useful year is the audiobook release year, not the original publication
-    # year. Fall back to the original year when BookBeat has no audiobook date.
+
+    # BookBeat can expose separate audiobook and e-book publishers. ABS has
+    # one publisher field, so use the audiobook publisher first and the
+    # e-book publisher as a fallback. If both are unavailable, keep JSON-LD.
+    data["publisher"] = (
+        meta.get("Wydawca audiobooka")
+        or meta.get("Wydawca e-booka")
+        or data["publisher"]
+    )
+
     data["publishedYear"] = (
         parse_year(meta.get("Data publikacji audiobooka"))
         or parse_year(meta.get("Oryginalny rok publikacji"))
         or data["publishedYear"]
     )
-    data["isbn"] = meta.get("Numer ISBN audiobooka") or data["isbn"]
+
+    # Same principle as publisher: prefer the audiobook ISBN, then use the
+    # e-book ISBN when the audiobook ISBN is absent.
+    data["isbn"] = (
+        meta.get("Numer ISBN audiobooka")
+        or meta.get("Numer ISBN e-book")
+        or data["isbn"]
+    )
 
     duration_candidates = []
     for text in soup.stripped_strings:
@@ -485,7 +481,6 @@ def parse_detail(html, candidate):
             duration_candidates.append(value)
     if duration_candidates:
         data["duration"] = parse_duration(duration_candidates[0])
-    # Do not use the e-book reading-time field as audiobook duration.
 
     data["genres"] = genres_from_bookbeat(soup) or list(dict.fromkeys(x for x in data["genres"] if x))
     data["series"], data["sequence"] = series_from_bookbeat(soup, flat)
