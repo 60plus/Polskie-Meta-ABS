@@ -2,13 +2,14 @@
 
 Jeden kontener Docker z providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/), przygotowanymi głównie z myślą o polskich książkach i audiobookach.
 
-Projekt łączy trzy źródła w jednej instalacji:
+Projekt łączy cztery źródła w jednej instalacji:
 
 | Provider | Źródło | Port |
 |---|---|---:|
 | **Storytel Polska** | https://www.storytel.com/pl | `3000` |
 | **Audioteka Polska** | https://audioteka.com/pl | `3001` |
 | **Lubimyczytać Polska** | https://lubimyczytac.pl | `3002` |
+| **BookBeat Polska** | https://www.bookbeat.com/pl | `3003` |
 
 Dla Audiobookshelf każdy z nich jest osobnym źródłem metadanych.
 
@@ -22,7 +23,8 @@ Dla Audiobookshelf każdy z nich jest osobnym źródłem metadanych.
 - pobierać język, gatunek, serię i numer tomu, jeśli źródło je udostępnia;
 - pobierać czas trwania audiobooka, jeśli jest dostępny;
 - obsługiwać audiobooki i cykle Audioteki;
-- obsługiwać zarówno książki, jak i audiobooki z Lubimyczytać.
+- obsługiwać zarówno książki, jak i audiobooki z Lubimyczytać;
+- obsługiwać audiobooki z BookBeat.
 
 Priorytetem są polskie wydania i dane katalogowe.
 
@@ -79,7 +81,14 @@ Nazwa: Lubimyczytać Polska
 URL: http://SERWER:3002
 ```
 
-Porty `3000`, `3001` i `3002` są przeznaczone do użycia przez Audiobookshelf. Porty wewnętrzne kontenera nie muszą być wystawiane na hosta.
+### BookBeat Polska
+
+```text
+Nazwa: BookBeat Polska
+URL: http://SERWER:3003
+```
+
+Porty `3000`–`3003` są przeznaczone do użycia przez Audiobookshelf. Porty wewnętrzne kontenera nie muszą być wystawiane na hosta.
 
 ## API
 
@@ -102,58 +111,17 @@ Authorization: <dowolna-wartość>
 
 Nie jest wymagane konto w serwisach źródłowych.
 
-Przykład:
-
-```bash
-curl -s \
-  -H 'Authorization: test' \
-  'http://localhost:3002/search?query=Siostry&author=Amelia%20Malisz'
-```
-
 ## Lubimyczytać Polska
 
 Provider Lubimyczytać wyszukuje **zarówno książki, jak i audiobooki**.
 
-Dla jednego zapytania sprawdzane są oba katalogi:
-
-```text
-https://lubimyczytac.pl/szukaj/ksiazki?phrase=...
-https://lubimyczytac.pl/szukaj/audiobooki?phrase=...
-```
-
-Następnie najlepsze wyniki są sprawdzane na stronach konkretnych produktów:
-
-```text
-https://lubimyczytac.pl/ksiazka/...
-https://lubimyczytac.pl/audiobook/...
-```
+Dla jednego zapytania sprawdzane są oba katalogi, a następnie najlepsze wyniki są sprawdzane na stronach konkretnych produktów.
 
 Dzięki temu audiobook nie jest ograniczony wyłącznie do informacji widocznych na liście wyszukiwania.
 
-### Metadane
-
-Provider pobiera między innymi:
-
-- tytuł;
-- autora;
-- lektora, jeśli jest podany;
-- opis;
-- okładkę;
-- wydawcę;
-- ISBN;
-- rok wydania;
-- język;
-- gatunek;
-- serię i numer tomu;
-- czas trwania/czytania, jeśli jest dostępny.
-
-W przypadku audiobooków dane są pobierane bezpośrednio ze strony audiobooka. Pozwala to uzyskać opis i pozostałe informacje dotyczące właściwego wydania, zamiast kopiować dane wyłącznie z książki o tym samym tytule.
-
-### Szybkie wyszukiwanie
+Provider pobiera między innymi tytuł, autora, lektora, opis, okładkę, wydawcę, ISBN, rok wydania, język, gatunek, serię, numer tomu i czas trwania, jeśli dane są dostępne.
 
 Lubimyczytać korzysta z bezpośredniego pobierania stron zamiast uruchamiania przeglądarki dla każdego wyniku. Książki i audiobooki są sprawdzane równolegle, a pełne dane są pobierane dopiero dla wybranych wyników.
-
-Wyniki wyszukiwania są również przez krótki czas zapamiętywane, dzięki czemu kolejne wyszukiwanie tego samego tytułu jest szybsze.
 
 ## Audioteka Polska
 
@@ -161,17 +129,29 @@ Provider Audioteki obsługuje audiobooki oraz cykle/audioseriale.
 
 Dane są pobierane ze strony właściwego produktu, dzięki czemu wynik może zawierać pełniejszy opis i informacje o wydaniu.
 
-Dla Audioteki obsługiwane są między innymi:
+## BookBeat Polska
 
-- tytuł;
-- autorzy;
-- lektorzy;
+Provider BookBeat wyszukuje polskie pozycje z katalogu BookBeat i pobiera dane ze stron konkretnych książek.
+
+Obsługiwane są między innymi:
+
+- wyszukiwanie po tytule;
+- wyszukiwanie po serii;
+- autor;
+- lektor;
 - opis;
 - okładka;
 - wydawca;
 - rok wydania;
-- czas trwania;
-- informacje o cyklu.
+- ISBN;
+- język;
+- gatunek;
+- seria i numer tomu;
+- czas trwania.
+
+BookBeat może udostępniać ten sam tytuł jako audiobook i e-book. Provider zwraca wynik jako audiobook, gdy jest używany jako źródło metadanych dla biblioteki audiobooków.
+
+Dla przykładu BookBeat posiada stronę produktu `Operacja Mir`, a wyszukiwanie serii może znaleźć również pozycje należące do danego cyklu. Dane takie jak opis, autor, lektor i czas trwania są pobierane ze strony produktu, a nie tylko z listy wyszukiwania.
 
 ## Dopasowanie
 
@@ -187,12 +167,13 @@ Health check każdego providera:
 curl http://localhost:3000/health
 curl http://localhost:3001/health
 curl http://localhost:3002/health
+curl http://localhost:3003/health
 ```
 
-Dla Lubimyczytać przykładowa odpowiedź:
+Przykładowa odpowiedź BookBeat:
 
 ```json
-{"status":"ok","provider":"lubimyczytac"}
+{"status":"ok","provider":"bookbeat"}
 ```
 
 ## Struktura projektu
@@ -201,12 +182,12 @@ Dla Lubimyczytać przykładowa odpowiedź:
 .
 ├── Dockerfile
 ├── compose.yml
-├── compose.override.yml
 ├── nginx.conf
 ├── requirements.txt
 ├── scraper.py
 ├── audioteka_provider.py
 ├── lubimyczytac_provider.py
+├── bookbeat_provider.py
 └── README.md
 ```
 
@@ -222,9 +203,13 @@ Provider Audioteki Polska — wyszukiwanie oraz pobieranie metadanych audiobook�
 
 Provider Lubimyczytać Polska — wyszukiwanie książek i audiobooków oraz pobieranie ich metadanych.
 
+### `bookbeat_provider.py`
+
+Provider BookBeat Polska — wyszukiwanie książek, wyszukiwanie po serii oraz pobieranie metadanych stron produktów.
+
 ### `nginx.conf`
 
-Łączy trzy providery w jeden kontener i udostępnia je na osobnych portach.
+Łączy cztery providery w jeden kontener i udostępnia je na osobnych portach.
 
 ### `Dockerfile` i `compose.yml`
 
