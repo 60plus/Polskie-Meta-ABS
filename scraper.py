@@ -11,17 +11,10 @@ from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 
 app = FastAPI(title="Polish Audiobookshelf Metadata Providers")
-
-# -----------------------------------------------------------------------------
-# Shared browser infrastructure
-# -----------------------------------------------------------------------------
-
 CACHE_TTL = 600
 MAX_RESULTS = 10
 _cache = {}
-_pw = None
-_browser = None
-_context = None
+_pw = _browser = _context = None
 _lock = asyncio.Lock()
 
 
@@ -101,11 +94,7 @@ async def browser_context():
         _pw = await async_playwright().start()
         _browser = await _pw.chromium.launch(
             headless=True,
-            args=[
-                "--no-sandbox",
-                "--disable-dev-shm-usage",
-                "--disable-blink-features=AutomationControlled",
-            ],
+            args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
         )
         _context = await _browser.new_context(
             locale="pl-PL",
@@ -129,9 +118,26 @@ async def goto(page, url):
     await page.wait_for_timeout(1800)
 
 
-# -----------------------------------------------------------------------------
-# Storytel provider
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Shared helpers for Audioteka
+# ----------------------------------------------------------------------------
+
+async def first_text(scope, selectors):
+    for selector in selectors:
+        try:
+            locator = scope.locator(selector).first
+            if await locator.count():
+                text = clean(await locator.text_content())
+                if text:
+                    return text
+        except Exception:
+            pass
+    return None
+
+
+# ----------------------------------------------------------------------------
+# Storytel Polska
+# ----------------------------------------------------------------------------
 
 STORYTEL_BASE = "https://www.storytel.com/pl"
 STORYTEL_SEARCH = STORYTEL_BASE + "/search/all"
@@ -150,15 +156,13 @@ def storytel_title_from_url(url):
 
 async def storytel_search_urls(page, query):
     url = f"{STORYTEL_SEARCH}?query={quote(query)}&formats=abook%2Cebook"
-    print(f"[Storytel] browser search: {url}")
+    print(f"[Storytel] search: {url}")
     await goto(page, url)
     for _ in range(5):
         await page.mouse.wheel(0, 1800)
         await page.wait_for_timeout(350)
 
-    hrefs = await page.locator("a[href*='/pl/books/']").evaluate_all(
-        "els => els.map(a => a.href).filter(Boolean)"
-    )
+    hrefs = await page.locator("a[href*='/pl/books/']").evaluate_all("els => els.map(a => a.href).filter(Boolean)")
     urls, seen = [], set()
     for href in hrefs:
         p = urlparse(href)
@@ -168,7 +172,7 @@ async def storytel_search_urls(page, query):
         if clean_url not in seen:
             seen.add(clean_url)
             urls.append(clean_url)
-    print(f"[Storytel] browser search '{query}' -> {len(urls)} book URLs")
+    print(f"[Storytel] '{query}' -> {len(urls)} book URLs")
     return urls
 
 
@@ -182,9 +186,8 @@ async def storytel_detail(page, url):
     scripts = await page.locator("script[type='application/ld+json']").all_text_contents()
     for raw in scripts:
         for item in jsonld(raw):
-            if item.get("name"):
-                title = clean(item.get("name")) or title
-            description = clean(item.get("description")) or description
+            title = clean(item.get("name")) or title
+            description = description or clean(item.get("description"))
             image = item.get("image")
             if isinstance(image, list):
                 image = image[0] if image else None
@@ -210,72 +213,53 @@ async def storytel_detail(page, url):
             elif genre:
                 genres.append(clean(genre))
 
-    body = await page.locator("body").inner_text(timeout=10000)
     if await page.locator("h1").count():
         title = clean(await page.locator("h1").first.text_content()) or title
-
     try:
         authors += [clean(x) for x in await page.locator("a[href*='/pl/authors/']").all_text_contents()]
         narrators += [clean(x) for x in await page.locator("a[href*='/pl/narrators/']").all_text_contents()]
     except Exception:
         pass
-
     try:
         cover = cover or await page.locator("meta[property='og:image']").get_attribute("content")
         description = description or await page.locator("meta[property='og:description']").get_attribute("content")
     except Exception:
         pass
 
+    body = await page.locator("body").inner_text(timeout=10000)
     authors = list(dict.fromkeys(x for x in authors if x))
     narrators = list(dict.fromkeys(x for x in narrators if x))
     genres = list(dict.fromkeys(x for x in genres if x))
-
-    isbn = isbn or ((re.search(r"\b(97[89]\d{10})\b", body) or [None, None])[1])
+    if not isbn:
+        m = re.search(r"\b(97[89]\d{10})\b", body)
+        isbn = m.group(1) if m else None
     published = published or year(body)
     dur = dur or duration(body)
     language = language or ("pol" if re.search(r"\b(?:Język\s*)?Polski\b", body, re.I) else None)
-    language = language or ("eng" if re.search(r"\b(?:Język\s*)?English\b", body, re.I) else None)
-
     if not series:
-        match = re.search(r"(?:Seria|Serie)\s+(.+?)\s+(\d+)\s+z\s+(\d+)", body, re.I)
-        if match:
-            series, sequence = clean(match.group(1)), match.group(2)
+        m = re.search(r"(?:Seria|Serie)\s+(.+?)\s+(\d+)\s+z\s+(\d+)", body, re.I)
+        if m:
+            series, sequence = clean(m.group(1)), m.group(2)
 
     return {
-        "title": title,
-        "authors": authors,
-        "narrators": narrators,
-        "publisher": publisher,
-        "description": description,
-        "cover": cover,
-        "isbn": isbn,
-        "publishedYear": published,
-        "language": language,
-        "duration": dur,
-        "genres": genres,
-        "series": series,
-        "sequence": sequence,
-        "url": url,
-        "storytelId": storytel_book_id(url),
+        "title": title, "authors": authors, "narrators": narrators,
+        "publisher": publisher, "description": description, "cover": cover,
+        "isbn": isbn, "publishedYear": published, "language": language,
+        "duration": dur, "genres": genres, "series": series,
+        "sequence": sequence, "url": url, "storytelId": storytel_book_id(url),
     }
 
 
 def storytel_match(book, score_value):
     return {
-        "title": book.get("title"),
-        "author": ", ".join(book.get("authors") or []) or None,
+        "title": book.get("title"), "author": ", ".join(book.get("authors") or []) or None,
         "narrator": ", ".join(book.get("narrators") or []) or None,
-        "publisher": book.get("publisher"),
-        "publishedYear": book.get("publishedYear"),
-        "description": book.get("description"),
-        "cover": book.get("cover"),
-        "isbn": book.get("isbn"),
+        "publisher": book.get("publisher"), "publishedYear": book.get("publishedYear"),
+        "description": book.get("description"), "cover": book.get("cover"), "isbn": book.get("isbn"),
         "genres": book.get("genres") or None,
         "series": ([{"series": book["series"], "sequence": book.get("sequence")}] if book.get("series") else None),
-        "language": book.get("language"),
-        "duration": book.get("duration"),
-        "type": "audiobook",
-        "similarity": score_value,
+        "language": book.get("language"), "duration": book.get("duration"),
+        "type": "audiobook", "similarity": score_value,
     }
 
 
@@ -284,7 +268,6 @@ async def storytel_search(query, author):
     cached = _cache.get(key)
     if cached and time.time() - cached[0] < CACHE_TTL:
         return cached[1]
-
     ctx = await browser_context()
     page = await ctx.new_page()
     try:
@@ -293,9 +276,9 @@ async def storytel_search(query, author):
             urls = await storytel_search_urls(page, f"{query} {author}")
     finally:
         await page.close()
-
     urls.sort(key=lambda u: sim(storytel_title_from_url(u), query), reverse=True)
     urls = urls[:40]
+
     books = []
     for i in range(0, len(urls), 4):
         pages = [await ctx.new_page() for _ in urls[i:i + 4]]
@@ -313,7 +296,6 @@ async def storytel_search(query, author):
             score_value += 0.05
         ranked.append((min(1.0, score_value), title_similarity, matched_author, book))
     ranked.sort(key=lambda item: item[0], reverse=True)
-
     final = []
     for score_value, title_similarity, matched_author, book in ranked:
         if title_similarity < 0.65 or (author and matched_author < 0.50):
@@ -321,16 +303,15 @@ async def storytel_search(query, author):
         final.append(storytel_match(book, score_value))
         if len(final) >= MAX_RESULTS:
             break
-
     print("[Storytel] final:", " | ".join(f"{x['title']}/{x['author']} ({x['similarity']:.3f})" for x in final))
     result = {"matches": final}
     _cache[key] = (time.time(), result)
     return result
 
 
-# -----------------------------------------------------------------------------
-# Audioteka provider
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# Audioteka Polska
+# ----------------------------------------------------------------------------
 
 AUDIOTEKA_BASE = "https://audioteka.com/pl"
 AUDIOTEKA_SEARCH = AUDIOTEKA_BASE + "/szukaj/"
@@ -339,9 +320,7 @@ AUDIOTEKA_SEARCH = AUDIOTEKA_BASE + "/szukaj/"
 def audioteka_abs_url(href):
     if not href:
         return ""
-    if href.startswith("http"):
-        return href
-    return "https://audioteka.com" + href
+    return href if href.startswith("http") else "https://audioteka.com" + href
 
 
 def audioteka_id(url):
@@ -356,7 +335,7 @@ def audioteka_title_from_url(url):
 
 async def audioteka_search_urls(page, query):
     url = f"{AUDIOTEKA_SEARCH}?phrase={quote(query)}"
-    print(f"[Audioteka] browser search: {url}")
+    print(f"[Audioteka] search: {url}")
     await goto(page, url)
     for _ in range(4):
         await page.mouse.wheel(0, 1600)
@@ -366,53 +345,44 @@ async def audioteka_search_urls(page, query):
     urls, seen = [], set()
     for href in hrefs:
         p = urlparse(href)
-        if p.netloc not in {"audioteka.com", "www.audioteka.com"}:
+        if p.netloc not in {"audioteka.com", "www.audioteka.com"} or not p.path.startswith("/pl/"):
             continue
-        if not p.path.startswith("/pl/"):
+        if any(x in p.path for x in ("/szukaj/", "/cykl/", "/kategoria/", "/autor/", "/wydawca/", "/tag/")):
             continue
-        # Product links contain a stable slug but are not limited to one legacy class.
-        if any(part in p.path for part in ("/cykl/", "/szukaj/", "/kategoria/", "/autor/", "/wydawca/")):
+        parts = [x for x in p.path.split("/") if x]
+        if len(parts) < 2:
             continue
         clean_url = f"https://audioteka.com{p.path.rstrip('/')}"
-        if clean_url.count("/") >= 4 and clean_url not in seen:
+        if clean_url not in seen:
             seen.add(clean_url)
             urls.append(clean_url)
-    print(f"[Audioteka] browser search '{query}' -> {len(urls)} URLs")
+    print(f"[Audioteka] '{query}' -> {len(urls)} candidate URLs")
     return urls
 
 
-def audioteka_selector_text(scope, selectors):
-    for selector in selectors:
-        loc = scope.locator(selector).first
-        try:
-            if loc.count() and (text := clean(loc.text_content())):
-                return text
-        except Exception:
-            continue
-    return None
+def audioteka_series_from_body(body):
+    for pattern in (
+        r"(?:Seria|Cykl)\s+(.+?)\s+(?:tom|część|nr)\s+(\d+)",
+        r"(?:Seria|Cykl)\s+(.+?)\s+(\d+)\s+z\s+\d+",
+    ):
+        m = re.search(pattern, body, re.I)
+        if m:
+            return clean(m.group(1)), m.group(2)
+    return None, None
 
 
 async def audioteka_detail(page, url):
     await goto(page, url)
     title = None
-    author = None
-    narrator = None
-    publisher = None
-    description = None
-    cover = None
-    isbn = None
-    published = None
-    language = "pol"
-    dur = None
-    genres = []
-    series = None
-    sequence = None
+    authors, narrators, genres = [], [], []
+    publisher = description = cover = isbn = None
+    published = dur = None
+    series = sequence = None
 
     scripts = await page.locator("script[type='application/ld+json']").all_text_contents()
     for raw in scripts:
         for item in jsonld(raw):
-            if item.get("name") and not title:
-                title = clean(item.get("name"))
+            title = title or clean(item.get("name"))
             description = description or clean(item.get("description"))
             image = item.get("image")
             if isinstance(image, list):
@@ -427,10 +397,12 @@ async def audioteka_detail(page, url):
             elif isinstance(pub, str):
                 publisher = publisher or clean(pub)
             author_data = item.get("author")
-            if isinstance(author_data, dict):
-                author = author or clean(author_data.get("name"))
+            if isinstance(author_data, list):
+                authors += [clean(x.get("name") if isinstance(x, dict) else x) for x in author_data]
+            elif isinstance(author_data, dict):
+                authors.append(clean(author_data.get("name")))
             elif isinstance(author_data, str):
-                author = author or clean(author_data)
+                authors.append(clean(author_data))
             genre = item.get("genre")
             if isinstance(genre, list):
                 genres += [clean(x) for x in genre]
@@ -440,52 +412,60 @@ async def audioteka_detail(page, url):
     if await page.locator("h1").count():
         title = clean(await page.locator("h1").first.text_content()) or title
 
-    # Current Audioteka uses CSS-module class names. Prefix selectors are more stable.
-    author = author or audioteka_selector_text(page, [
+    author_text = await first_text(page, [
         "[class*='teaser_author__']",
-        "[class*='author']",
         "a[href*='/pl/autor/']",
+        "a[href*='/pl/author/']",
+        "[class*='author']",
     ])
-    narrator = audioteka_selector_text(page, [
+    if author_text:
+        authors.append(author_text)
+
+    narrator_text = await first_text(page, [
         "dt:has-text('Głosy') + dd",
+        "dt:has-text('Lektor') + dd",
         "tr:has-text('Głosy') td:last-child",
+        "tr:has-text('Lektor') td:last-child",
         "[class*='narrator']",
     ])
-    publisher = publisher or audioteka_selector_text(page, [
+    if narrator_text:
+        narrators.append(narrator_text)
+
+    publisher = publisher or await first_text(page, [
         "dt:has-text('Wydawca') + dd",
         "tr:has-text('Wydawca') td:last-child",
         "[class*='publisher']",
     ])
-    description = description or await page.locator("meta[property='og:description']").get_attribute("content")
-    cover = cover or await page.locator("meta[property='og:image']").get_attribute("content")
+
+    try:
+        description = description or await page.locator("meta[property='og:description']").get_attribute("content")
+        cover = cover or await page.locator("meta[property='og:image']").get_attribute("content")
+    except Exception:
+        pass
 
     body = await page.locator("body").inner_text(timeout=10000)
-    isbn = isbn or ((re.search(r"\b(97[89]\d{10})\b", body) or [None, None])[1])
+    authors = list(dict.fromkeys(x for x in authors if x))
+    narrators = list(dict.fromkeys(x for x in narrators if x))
+    genres = list(dict.fromkeys(x for x in genres if x))
+    if not isbn:
+        m = re.search(r"\b(97[89]\d{10})\b", body)
+        isbn = m.group(1) if m else None
     published = published or year(body)
     dur = dur or duration(body)
-
-    # Series information occurs on Audioteka serial / series pages.
-    for pattern in (
-        r"(?:Seria|Cykl)\s+(.+?)\s+(?:tom|część|nr)\s+(\d+)",
-        r"(?:Seria|Cykl)\s+(.+?)\s+(\d+)\s+z\s+\d+",
-    ):
-        match = re.search(pattern, body, re.I)
-        if match:
-            series, sequence = clean(match.group(1)), match.group(2)
-            break
+    series, sequence = audioteka_series_from_body(body)
 
     return {
         "title": title or audioteka_title_from_url(url),
-        "author": author,
-        "narrator": narrator,
+        "author": ", ".join(authors) if authors else None,
+        "narrator": ", ".join(narrators) if narrators else None,
         "publisher": publisher,
         "description": description,
         "cover": cover,
         "isbn": isbn,
         "publishedYear": published,
-        "language": language,
+        "language": "pol",
         "duration": dur,
-        "genres": list(dict.fromkeys(g for g in genres if g)),
+        "genres": genres,
         "series": series,
         "sequence": sequence,
         "url": url,
@@ -495,20 +475,13 @@ async def audioteka_detail(page, url):
 
 def audioteka_match(book, score_value):
     return {
-        "title": book.get("title"),
-        "author": book.get("author"),
-        "narrator": book.get("narrator"),
-        "publisher": book.get("publisher"),
-        "publishedYear": book.get("publishedYear"),
-        "description": book.get("description"),
-        "cover": book.get("cover"),
-        "isbn": book.get("isbn"),
+        "title": book.get("title"), "author": book.get("author"), "narrator": book.get("narrator"),
+        "publisher": book.get("publisher"), "publishedYear": book.get("publishedYear"),
+        "description": book.get("description"), "cover": book.get("cover"), "isbn": book.get("isbn"),
         "genres": book.get("genres") or None,
         "series": ([{"series": book["series"], "sequence": book.get("sequence")}] if book.get("series") else None),
-        "language": book.get("language"),
-        "duration": book.get("duration"),
-        "type": "audiobook",
-        "similarity": score_value,
+        "language": book.get("language"), "duration": book.get("duration"),
+        "type": "audiobook", "similarity": score_value,
     }
 
 
@@ -552,21 +525,28 @@ async def audioteka_search(query, author):
         final.append(audioteka_match(book, min(1.0, score_value)))
         if len(final) >= MAX_RESULTS:
             break
-
     print("[Audioteka] final:", " | ".join(f"{x['title']}/{x['author']} ({x['similarity']:.3f})" for x in final))
     result = {"matches": final}
     _cache[key] = (time.time(), result)
     return result
 
 
-# -----------------------------------------------------------------------------
-# Unified API
-# -----------------------------------------------------------------------------
+# ----------------------------------------------------------------------------
+# HTTP API. Each provider has its own port so ABS can add them separately.
+# ----------------------------------------------------------------------------
+
+async def authenticate(authorization):
+    if not authorization:
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+# Storytel runs on 3000 when PORT=3000. Audioteka runs on 3001 by using
+# the same application code with PROVIDER=audioteka and PORT=3001 in the
+# container command. Kept in one source file to share Playwright infrastructure.
 
 @app.get("/providers")
 async def providers(authorization: str | None = Header(default=None)):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Unauthorized")
+    await authenticate(authorization)
     return {
         "providers": [
             {"id": "storytel-pl", "name": "Storytel Polska", "port": 3000},
@@ -582,19 +562,12 @@ async def search_endpoint(
     author: str = Query(""),
     authorization: str | None = Header(default=None),
 ):
-    if not authorization:
-        raise HTTPException(status_code=401, detail="Unauthorized")
-    try:
-        if provider in {"storytel", "storytel-pl"}:
-            return JSONResponse(await storytel_search(query, author))
-        if provider in {"audioteka", "audioteka-pl"}:
-            return JSONResponse(await audioteka_search(query, author))
-        raise HTTPException(status_code=404, detail="Unknown provider")
-    except HTTPException:
-        raise
-    except Exception as exc:
-        print(f"[{provider}] ERROR: {exc!r}")
-        return JSONResponse({"matches": [], "error": str(exc)}, status_code=500)
+    await authenticate(authorization)
+    if provider in {"storytel", "storytel-pl"}:
+        return JSONResponse(await storytel_search(query, author))
+    if provider in {"audioteka", "audioteka-pl"}:
+        return JSONResponse(await audioteka_search(query, author))
+    raise HTTPException(status_code=404, detail="Unknown provider")
 
 
 @app.get("/health")
