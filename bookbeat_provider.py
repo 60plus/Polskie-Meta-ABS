@@ -12,7 +12,6 @@ from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
 app = FastAPI(title="BookBeat Polska Metadata Provider")
-
 BASE = "https://www.bookbeat.com"
 PL = f"{BASE}/pl"
 SEARCH = f"{PL}/search"
@@ -23,10 +22,13 @@ _cache = {}
 _lock = asyncio.Lock()
 
 HEADERS = {
-    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
+    "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
-    "Cache-Control": "no-cache",
+    "Upgrade-Insecure-Requests": "1",
+    "Sec-Fetch-Dest": "document",
+    "Sec-Fetch-Mode": "navigate",
+    "Sec-Fetch-Site": "same-origin",
 }
 
 
@@ -147,27 +149,42 @@ async def get_http():
 
 async def fetch_html(url):
     client = await get_http()
-    for attempt in range(1, 4):
+    for attempt in range(1, 3):
         try:
-            response = await client.get(url, headers={"Referer": f"{PL}/"})
+            response = await client.get(
+                url,
+                headers={"Referer": f"{PL}/", "Sec-Fetch-Site": "same-origin"},
+            )
             if response.status_code == 429:
                 await asyncio.sleep(1.0 * attempt)
                 continue
             response.raise_for_status()
             return response.text
         except Exception as exc:
-            if attempt == 3:
+            if attempt == 2:
                 print(f"[BookBeat] HTTP failed: {url} {type(exc).__name__}: {exc}")
                 return None
             await asyncio.sleep(0.25 * attempt)
     return None
 
 
+async def warmup_bookbeat():
+    """Establish the same BookBeat session/cookies used by the search page."""
+    client = await get_http()
+    try:
+        response = await client.get(f"{PL}/", headers={"Referer": BASE + "/"})
+        response.raise_for_status()
+        print("[BookBeat] session warm-up: ok")
+        return True
+    except Exception as exc:
+        print(f"[BookBeat] session warm-up failed: {type(exc).__name__}: {exc}")
+        return False
+
+
 def extract_book_urls(html):
     text = html.replace("\\/", "/").replace("\\u002F", "/").replace("\\u002f", "/")
     found = []
     seen = set()
-
     patterns = (
         r"https?://(?:www\.)?bookbeat\.com/pl/book/[A-Za-z0-9][A-Za-z0-9_-]*-\d+",
         r"/pl/book/[A-Za-z0-9][A-Za-z0-9_-]*-\d+",
@@ -181,27 +198,17 @@ def extract_book_urls(html):
     return found
 
 
-async def search_page(query):
-    # BookBeat expects the search term in its normal query-string form. In
-    # particular, use '+' rather than '%20' here; this is also the URL format
-    # produced by BookBeat's own search links.
-    url = f"{SEARCH}?q={quote_plus(query)}&title={quote_plus(query)}"
-    print(f"[BookBeat] search: {url}")
-    html = await fetch_html(url)
-    if not html:
-        return []
-
+def parse_search_html(html):
     soup = BeautifulSoup(html, "html.parser")
     found = []
     seen = set()
 
-    # Prefer real result links. BookBeat also embeds result routes in the
-    # serialized page/application state, so use those as a fallback.
     for link in soup.select("a[href*='/pl/book/']"):
         href = canonical(urljoin(BASE, link.get("href") or ""))
         if not href or not is_book_url(href) or href in seen:
             continue
         seen.add(href)
+
         card = link
         for _ in range(6):
             parent = getattr(card, "parent", None)
@@ -213,15 +220,20 @@ async def search_page(query):
                 break
 
         title = None
-        for selector in ("h1", "h2", "h3", "h4", "[data-testid*='title']"):
+        for selector in ("h1", "h2", "h3", "h4", "[data-testid='book-card-title']", "[data-testid*='title']"):
             node = card.select_one(selector)
             if node:
                 title = clean(node.get_text(" ", strip=True))
                 if title:
                     break
-        title = title or clean(link.get_text(" ", strip=True)) or url_title(href)
+        title = title or clean(link.get("aria-label")) or clean(link.get_text(" ", strip=True)) or url_title(href)
 
         authors = []
+        author_node = card.select_one("[data-testid='book-card-author']")
+        if author_node:
+            value = clean(author_node.get_text(" ", strip=True))
+            if value:
+                authors.append(value)
         for selector in ("a[href*='/authors/']", "a[href*='/author/']"):
             authors.extend(clean(x.get_text(" ", strip=True)) for x in card.select(selector))
         authors = list(dict.fromkeys(x for x in authors if x))
@@ -248,8 +260,33 @@ async def search_page(query):
             seen.add(href)
             found.append({"url": href, "title": url_title(href), "authors": [], "cover": None})
 
-    print(f"[BookBeat] search '{query}' -> {len(found)} book URLs")
     return found
+
+
+async def search_page(query):
+    url = f"{SEARCH}?q={quote_plus(query)}&title={quote_plus(query)}"
+    print(f"[BookBeat] search: {url}")
+    html = await fetch_html(url)
+    if html:
+        found = parse_search_html(html)
+        if found:
+            print(f"[BookBeat] search '{query}' -> {len(found)} book URLs")
+            return found
+
+    # BookBeat sometimes returns a shell without the result cards to a fresh
+    # HTTP client. Reuse one session after loading /pl/ and retry the exact
+    # same search URL. This is a fallback only, so normal searches stay fast.
+    print(f"[BookBeat] search '{query}' -> 0 book URLs, retrying with warm session")
+    if await warmup_bookbeat():
+        html = await fetch_html(url)
+        if html:
+            found = parse_search_html(html)
+            if found:
+                print(f"[BookBeat] search '{query}' retry -> {len(found)} book URLs")
+                return found
+
+    print(f"[BookBeat] search '{query}' -> 0 book URLs")
+    return []
 
 
 def find_label_text(text, labels):
@@ -363,11 +400,18 @@ async def bookbeat_search(query, author=""):
         print(f"[BookBeat] cache hit: {key}")
         return cached[1]
 
-    # One real BookBeat title search is enough. Do not make parallel series or
-    # "title + author" requests: those produced duplicates, slower searches and
-    # unrelated results such as Olycksfågeln.
     candidates = await search_page(query)
-    seen = {x["url"] for x in candidates}
+
+    if author:
+        def candidate_rank(item):
+            title_score = similarity(item.get("title"), query)
+            author_score = similarity(item.get("authors", [""])[0] if item.get("authors") else "", author)
+            return title_score * 0.75 + author_score * 0.25
+        candidates.sort(key=candidate_rank, reverse=True)
+    else:
+        candidates.sort(key=lambda item: similarity(item.get("title"), query), reverse=True)
+
+    candidates = candidates[:20]
     print(f"[BookBeat] candidates to parse: {len(candidates)}")
 
     async def enrich(item):
@@ -376,9 +420,9 @@ async def bookbeat_search(query, author=""):
             return None
         try:
             data = parse_detail(html, item)
-            title_score = similarity(data.get("title"), query)
-            author_score = similarity(data.get("author"), author) if author else 1.0
-            score = title_score * 0.75 + author_score * 0.25 if author else title_score
+            ts = similarity(data.get("title"), query)
+            aa = similarity(data.get("author"), author) if author else 1.0
+            score = ts * 0.75 + aa * 0.25 if author else ts
             if data.get("language") == "pol":
                 score = min(1.0, score + 0.02)
             print(f"[BookBeat] detail: {data.get('title')} / {data.get('author')} score={score:.3f} url={data.get('url')}")
