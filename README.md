@@ -1,6 +1,6 @@
 # Polskie Meta ABS
 
-Jeden kontener Docker z niezależnymi providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/), przygotowanymi z myślą o polskich katalogach audiobooków.
+Jeden kontener Docker z niezależnymi providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/), przygotowanymi z myślą o polskich katalogach książek i audiobooków.
 
 Projekt łączy kilka polskich źródeł w jedną instalację. Każdy provider ma własny scraper i własne reguły dopasowania, ale wszystkie korzystają ze wspólnego środowiska Chromium/Playwright.
 
@@ -10,20 +10,22 @@ Projekt łączy kilka polskich źródeł w jedną instalację. Każdy provider m
 |---|---|---:|
 | **Storytel Polska** | https://www.storytel.com/pl | `3000` |
 | **Audioteka Polska** | https://audioteka.com/pl | `3001` |
+| **Lubimyczytać Polska** | https://lubimyczytac.pl | `3002` |
 
-Z punktu widzenia Audiobookshelf są to dwa osobne providery. Technicznie działają jednak w jednym kontenerze.
+Z punktu widzenia Audiobookshelf są to trzy osobne providery. Technicznie działają jednak w jednym kontenerze.
 
 ## Funkcje
 
-- wyszukiwanie polskich wydań audiobooków;
+- wyszukiwanie polskich wydań książek i audiobooków;
 - wyszukiwanie po tytule i opcjonalnie autorze;
 - dopasowanie wyników na podstawie tytułu i autora;
 - pobieranie danych ze stron konkretnych produktów;
 - obsługa audiobooków oraz cykli Audioteki;
+- obsługa zarówno książek, jak i audiobooków z Lubimyczytać;
 - okładki;
 - opisy;
 - autorzy;
-- lektorzy i głosy;
+- lektorzy i głosy, jeżeli źródło je udostępnia;
 - wydawcy;
 - rok publikacji/wydania;
 - ISBN, jeżeli jest dostępny;
@@ -36,17 +38,17 @@ Priorytetem są **polskie wydania i polskie dane katalogowe**.
 
 ## Jak to działa
 
-Storytel i Audioteka korzystają z nowoczesnych stron renderowanych przez JavaScript. Dlatego scraper nie ogranicza się do zwykłego pobrania HTML.
+Storytel, Audioteka i Lubimyczytać korzystają z nowoczesnych stron internetowych, dlatego scraper nie ogranicza się do zwykłego pobrania HTML.
 
 Do obsługi katalogów wykorzystywany jest Chromium uruchamiany przez Playwright. Dzięki temu scraper może korzystać z danych pojawiających się dopiero po wykonaniu JavaScriptu.
 
 ```text
-                         ┌── :3000 ──► Storytel Polska
-Audiobookshelf ── Nginx ─┤
-                         └── :3001 ──► Audioteka Polska
-                                  │
-                         wspólny kontener
-                         Playwright + Chromium
+                              ┌── :3000 ──► Storytel Polska
+Audiobookshelf ── Nginx ──────┼── :3001 ──► Audioteka Polska
+                              └── :3002 ──► Lubimyczytać Polska
+                                         │
+                                  wspólny kontener
+                                  Playwright + Chromium
 ```
 
 Wewnątrz kontenera providery działają jako osobne aplikacje FastAPI, a Nginx rozdziela ruch na podstawie portu:
@@ -54,6 +56,7 @@ Wewnątrz kontenera providery działają jako osobne aplikacje FastAPI, a Nginx 
 ```text
 :3000 → 127.0.0.1:8000 → Storytel
 :3001 → 127.0.0.1:8001 → Audioteka
+:3002 → 127.0.0.1:8002 → Lubimyczytać
 ```
 
 ## Uruchomienie
@@ -65,6 +68,8 @@ git clone https://github.com/60plus/Polskie-Meta-ABS.git
 cd Polskie-Meta-ABS
 docker compose up -d --build
 ```
+
+`compose.override.yml` jest automatycznie dołączany przez Docker Compose i dodaje mapowanie portu `3002`.
 
 Sprawdzenie kontenera:
 
@@ -98,7 +103,13 @@ http://SERWER:3000
 http://SERWER:3001
 ```
 
-Porty `3000` i `3001` są przeznaczone do użycia przez Audiobookshelf. Porty `8000` i `8001` są wewnętrzne dla kontenera i nie wymagają wystawiania na hosta.
+### Lubimyczytać Polska
+
+```text
+http://SERWER:3002
+```
+
+Porty `3000`, `3001` i `3002` są przeznaczone do użycia przez Audiobookshelf. Porty `8000`, `8001` i `8002` są wewnętrzne dla kontenera i nie wymagają wystawiania na hosta.
 
 ## Konfiguracja w Audiobookshelf
 
@@ -118,11 +129,18 @@ Nazwa: Audioteka Polska
 URL: http://SERWER:3001
 ```
 
-Dzięki temu Audiobookshelf może korzystać z obu katalogów niezależnie, mimo że scraper działa w jednym kontenerze.
+### Lubimyczytać Polska
+
+```text
+Nazwa: Lubimyczytać Polska
+URL: http://SERWER:3002
+```
+
+Dzięki temu Audiobookshelf może korzystać z trzech katalogów niezależnie, mimo że scraper działa w jednym kontenerze.
 
 ## API
 
-Oba providery udostępniają endpoint:
+Każdy provider udostępnia endpoint:
 
 ```text
 GET /search
@@ -139,7 +157,7 @@ Wymagany jest nagłówek:
 Authorization: <dowolna-wartość>
 ```
 
-Nie jest wymagane logowanie do konta Storytel ani Audioteka.
+Nie jest wymagane logowanie do konta źródła.
 
 ### Przykład — Storytel
 
@@ -157,21 +175,34 @@ curl -s \
   'http://localhost:3001/search?query=Operacja%20Mir&author=Remigiusz%20Mr%C3%B3z'
 ```
 
+### Przykład — Lubimyczytać
+
+```bash
+curl -s \
+  -H 'Authorization: test' \
+  'http://localhost:3002/search?query=Rewizja&author=Remigiusz%20Mr%C3%B3z'
+```
+
+Lub dla audiobooka:
+
+```bash
+curl -s \
+  -H 'Authorization: test' \
+  'http://localhost:3002/search?query=Siostry'
+```
+
 ## Health check
 
 ```bash
 curl http://localhost:3000/health
 curl http://localhost:3001/health
+curl http://localhost:3002/health
 ```
 
-Przykładowe odpowiedzi:
+Przykładowa odpowiedź Lubimyczytać:
 
 ```json
-{"status":"ok","provider":"storytel"}
-```
-
-```json
-{"status":"ok","provider":"audioteka"}
+{"status":"ok","provider":"lubimyczytac"}
 ```
 
 ## Metadane Audioteki
@@ -194,8 +225,6 @@ opis jest pobierany z dedykowanego elementu:
 #audiobook-description
 ```
 
-z fallbackami dla starszych wariantów HTML.
-
 ### Cykl / audioserial
 
 Dla stron:
@@ -212,6 +241,46 @@ paragraph_description_
 
 Dzięki temu opis nie jest przypadkowo pobierany z rekomendacji, stopki, recenzji lub innych elementów strony.
 
+## Lubimyczytać
+
+Provider Lubimyczytać działa niezależnie na porcie `3002` i wyszukuje **zarówno książki, jak i audiobooki**. Nie ogranicza wyników wyłącznie do audiobooków, ponieważ strona książki może zawierać lepszy lub bardziej kompletny opis oraz dane wydania.
+
+Wyniki są następnie otwierane na stronach szczegółowych, np.:
+
+```text
+https://lubimyczytac.pl/audiobook/...
+https://lubimyczytac.pl/ksiazka/...
+```
+
+### Opis
+
+Dla obu typów stron opis jest pobierany z dedykowanego elementu:
+
+```text
+#book-description
+```
+
+To ważne, ponieważ opis może być zwinięty przyciskiem „więcej”, ale treść nadal znajduje się w tym elemencie i może zostać odczytana bez klikania.
+
+### Dane książki
+
+Provider wykorzystuje dane ze strony szczegółowej oraz JSON-LD i może zwrócić między innymi:
+
+- tytuł;
+- autora;
+- lektora, jeśli jest podany;
+- wydawcę;
+- opis;
+- okładkę;
+- ISBN;
+- datę/rok wydania;
+- język;
+- kategorię/gatunek;
+- cykl i numer tomu;
+- czas czytania lub trwania, jeżeli jest dostępny.
+
+Dzięki temu zwykła książka może być użyta jako wartościowe źródło metadanych również wtedy, gdy użytkownik dopasowuje audiobook.
+
 ## Dopasowanie wyników
 
 Wyniki nie są wybierane wyłącznie na podstawie pierwszego znalezionego adresu URL.
@@ -220,19 +289,19 @@ Provider bierze pod uwagę między innymi:
 
 - podobieństwo tytułu;
 - podobieństwo autora, jeśli został podany;
-- typ strony — audiobook lub cykl;
 - dane pobrane ze strony szczegółowej;
+- typ wyniku — książka lub audiobook;
 - zgodność znalezionego produktu z zapytaniem.
 
-W przypadku Audioteki scraper rozróżnia właściwe strony produktów od stron katalogowych, takich jak listy nowości, bestsellery czy oferty specjalne.
+Dla Lubimyczytać celowo pozostawiono oba typy wyników, ponieważ ten sam tytuł może występować jako zwykła książka oraz audiobook, a dane między wydaniami mogą się różnić.
 
 ## Wydajność i stabilność
 
-Strony katalogów mogą wykonywać długotrwałe żądania w tle, dlatego scraper nie czeka na `networkidle`. Strona jest otwierana po załadowaniu DOM, a następnie scraper czeka tylko na potrzebne elementy.
+Strony katalogów mogą wykonywać długotrwałe żądania w tle, dlatego providerzy nie muszą czekać na `networkidle`. Strona jest otwierana po załadowaniu DOM, a następnie scraper czeka tylko na potrzebne elementy.
 
-Wspólne środowisko Chromium jest utrzymywane przez cały czas działania kontenera, a wyniki wyszukiwania mogą być obsługiwane z cache.
+Wspólne środowisko Chromium jest utrzymywane przez cały czas działania kontenera, a wyniki wyszukiwania są obsługiwane z cache przez ograniczony czas.
 
-Ma to ograniczyć czas odpowiedzi i uniknąć sytuacji, w której Audiobookshelf musi wielokrotnie ponawiać to samo wyszukiwanie.
+Ma to ograniczyć czas odpowiedzi i zmniejszyć liczbę ponownych wyszukiwań wykonywanych przez Audiobookshelf.
 
 ## Architektura projektu
 
@@ -240,25 +309,26 @@ Ma to ograniczyć czas odpowiedzi i uniknąć sytuacji, w której Audiobookshelf
 .
 ├── Dockerfile
 ├── compose.yml
+├── compose.override.yml
 ├── nginx.conf
 ├── requirements.txt
 ├── scraper.py
-├── storytel_provider.py
 ├── audioteka_provider.py
+├── lubimyczytac_provider.py
 └── README.md
 ```
 
 ### `scraper.py`
 
-Wspólna warstwa aplikacyjna i endpointy używane przez Audiobookshelf.
-
-### `storytel_provider.py`
-
-Niezależny scraper Storytel Polska — wyszukiwanie, pobieranie strony produktu i dopasowanie metadanych.
+Provider Storytel Polska oraz wspólna warstwa aplikacyjna dla pierwszego providera.
 
 ### `audioteka_provider.py`
 
 Niezależny scraper Audioteki Polska — wyszukiwanie, obsługa stron audiobooków i cykli oraz pobieranie metadanych z właściwych sekcji strony.
+
+### `lubimyczytac_provider.py`
+
+Niezależny scraper Lubimyczytać Polska — wyszukiwanie książek i audiobooków, otwieranie stron szczegółowych oraz pobieranie metadanych z dedykowanych elementów strony.
 
 ### `nginx.conf`
 
@@ -267,11 +337,16 @@ Rozdziela ruch na podstawie portu:
 ```text
 3000 → Storytel
 3001 → Audioteka
+3002 → Lubimyczytać
 ```
 
 ### `Dockerfile`
 
 Buduje jeden obraz zawierający środowisko potrzebne do uruchomienia FastAPI, Playwright/Chromium oraz Nginx.
+
+### `compose.override.yml`
+
+Dodaje mapowanie portu `3002` do hosta. Plik jest automatycznie uwzględniany przez Docker Compose przy standardowym `docker compose up`.
 
 ## Dodawanie kolejnych katalogów
 
@@ -291,6 +366,6 @@ Dodanie kolejnego katalogu nie wymaga tworzenia osobnego kontenera.
 
 ## Uwagi
 
-Strony Storytel i Audioteka mogą zmieniać HTML, routing, selektory lub sposób renderowania danych. W takim przypadku odpowiedni provider może wymagać aktualizacji.
+Strony Storytel, Audioteka i Lubimyczytać mogą zmieniać HTML, routing, selektory lub sposób renderowania danych. W takim przypadku odpowiedni provider może wymagać aktualizacji.
 
 Projekt korzysta z publicznie dostępnych danych katalogowych. Prawa do opisów, okładek, treści i innych materiałów pobieranych ze stron pozostają przy ich właścicielach.
