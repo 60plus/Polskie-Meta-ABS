@@ -71,8 +71,9 @@ def jsonld_objects(raw):
     for item in values:
         if isinstance(item, dict):
             result.append(item)
-            if isinstance(item.get("@graph"), list):
-                result.extend(x for x in item["@graph"] if isinstance(x, dict))
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                result.extend(x for x in graph if isinstance(x, dict))
     return result
 
 
@@ -80,17 +81,17 @@ def first_name(value):
     if isinstance(value, dict):
         return clean(value.get("name"))
     if isinstance(value, list):
-        values = [first_name(x) for x in value]
-        return ", ".join(dict.fromkeys(x for x in values if x)) or None
+        names = [first_name(x) for x in value]
+        return ", ".join(dict.fromkeys(x for x in names if x)) or None
     return clean(value)
 
 
 def canonical(url):
-    p = urlparse(url)
-    return f"{BASE}{p.path.rstrip('/')}/"
+    parsed = urlparse(url)
+    return f"{BASE}{parsed.path.rstrip('/')}/"
 
 
-def valid_product_url(url):
+def is_product_url(url):
     path = urlparse(url).path.rstrip("/")
     return path.startswith("/ksiazka/") or path.startswith("/audiobook/")
 
@@ -101,16 +102,21 @@ def path_type(url):
 
 def url_title(url):
     slug = urlparse(url).path.rstrip("/").split("/")[-1]
-    return re.sub(r"[-_]+", " ", slug)
+    return re.sub(r"[-_]+", " ", slug).strip()
 
 
-def label_value(lines, labels):
+def lines_from_body(body):
+    return [clean(x) for x in str(body or "").splitlines() if clean(x)]
+
+
+def value_after_label(lines, labels):
     wanted = {norm(x) for x in labels}
     for i, line in enumerate(lines):
-        if norm(line) in wanted:
-            for nxt in lines[i + 1:i + 4]:
-                if nxt and norm(nxt) not in wanted:
-                    return nxt
+        if norm(line) not in wanted:
+            continue
+        for candidate in lines[i + 1:i + 5]:
+            if candidate and norm(candidate) not in wanted:
+                return candidate
     return None
 
 
@@ -144,7 +150,7 @@ async def get_context():
 
 
 async def open_page(page, url, wait=250):
-    await page.goto(url, wait_until="domcontentloaded", timeout=15000)
+    await page.goto(url, wait_until="domcontentloaded", timeout=20000)
     await page.wait_for_timeout(wait)
 
 
@@ -153,159 +159,196 @@ async def search_page(page, query, section):
     print(f"[Lubimyczytać] search: {url}")
     await open_page(page, url, 300)
 
-    # Parse actual result cards only; never collect every /ksiazka/ or
-    # /audiobook/ navigation link from the whole document.
-    cards = page.locator(".book-card--l, .authorAllBooks__single")
+    # Exact card parsing: do not collect navigation links from the whole page.
+    cards = page.locator(".book-card--l")
     found, seen = [], set()
     for i in range(await cards.count()):
         card = cards.nth(i)
         try:
-            link = card.locator("a[href*='/ksiazka/'], a[href*='/audiobook/']").first
+            link = card.locator(".book-card__title[href]").first
+            if not await link.count():
+                link = card.locator("a[href*='/ksiazka/'], a[href*='/audiobook/']").first
             href = await link.get_attribute("href") if await link.count() else None
-            if not href:
-                continue
-            title_loc = card.locator(".book-card__title, .authorAllBooks__singleTextTitle").first
+            title_loc = card.locator(".book-card__title").first
             title = clean(await title_loc.text_content()) if await title_loc.count() else None
-            if not title:
+            if not href or not title:
                 continue
             href = href if href.startswith("http") else f"{BASE}{href}"
             href = canonical(href)
-            if not valid_product_url(href) or href in seen:
+            if not is_product_url(href) or href in seen:
                 continue
             authors = [clean(x) for x in await card.locator(".book-card__author a, a[href*='/autor/']").all_text_contents() if clean(x)]
             seen.add(href)
             found.append({"url": href, "title": title, "authors": list(dict.fromkeys(authors)), "type": path_type(href)})
         except Exception:
             continue
+
     print(f"[Lubimyczytać] {section} '{query}' -> {len(found)} wyników")
     return found
 
 
 async def parse_detail(page, candidate):
     url = candidate["url"]
-    query = candidate["query"]
-    await open_page(page, url, 150)
+    await open_page(page, url, 450)
     body = await page.locator("body").inner_text()
-    lines = [clean(x) for x in body.splitlines() if clean(x)]
+    lines = lines_from_body(body)
+    item_type = path_type(url)
     data = {
         "title": candidate.get("title"),
         "author": ", ".join(candidate.get("authors") or []) or None,
-        "narrator": None, "publisher": None, "publishedYear": None,
-        "description": None, "cover": None, "isbn": None, "duration": None,
-        "genres": [], "series": None, "sequence": None, "language": "pol",
-        "url": canonical(url), "type": path_type(url),
+        "narrator": None,
+        "publisher": None,
+        "publishedYear": None,
+        "description": None,
+        "cover": None,
+        "isbn": None,
+        "duration": None,
+        "genres": [],
+        "series": None,
+        "sequence": None,
+        "language": "pol",
+        "url": canonical(url),
+        "type": item_type,
     }
 
-    objects = []
-    for raw in await page.locator("script[type='application/ld+json']").all_text_contents():
-        objects.extend(jsonld_objects(raw))
-    target, best = None, -1
-    for item in objects:
-        name = clean(item.get("name"))
-        if name:
-            s = similarity(name, query)
-            if s > best:
-                target, best = item, s
-    if target:
-        data["title"] = clean(target.get("name")) or data["title"]
-        data["author"] = first_name(target.get("author")) or data["author"]
-        data["description"] = clean(target.get("description"))
-        data["isbn"] = clean(target.get("isbn"))
-        data["publishedYear"] = parse_year(target.get("datePublished"))
-        data["duration"] = parse_duration(target.get("duration"))
-        image = target.get("image")
-        if isinstance(image, list):
-            image = image[0] if image else None
-        data["cover"] = clean(image)
-        pub = target.get("publisher")
-        if isinstance(pub, dict):
-            pub = pub.get("name")
-        data["publisher"] = clean(pub)
-        genre = target.get("genre")
-        data["genres"] = [clean(x) for x in genre if clean(x)] if isinstance(genre, list) else ([clean(genre)] if genre else [])
-
+    # Page H1 is authoritative. This also prevents recommendation JSON-LD from
+    # replacing the product title.
     h1 = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
     if h1:
         data["title"] = h1
 
+    objects = []
+    for raw in await page.locator("script[type='application/ld+json']").all_text_contents():
+        objects.extend(jsonld_objects(raw))
+
+    # Only consider JSON-LD objects whose name matches the current product.
+    target = None
+    best = -1.0
+    current_title = data.get("title") or candidate.get("title") or url_title(url)
+    for item in objects:
+        name = clean(item.get("name"))
+        if not name:
+            continue
+        s = similarity(name, current_title)
+        if s > best:
+            target, best = item, s
+
+    if target and best >= 0.85:
+        data["title"] = clean(target.get("name")) or data["title"]
+        json_author = first_name(target.get("author"))
+        if json_author:
+            data["author"] = json_author
+        data["description"] = clean(target.get("description")) or data["description"]
+        data["isbn"] = clean(target.get("isbn")) or data["isbn"]
+        data["publishedYear"] = parse_year(target.get("datePublished")) or data["publishedYear"]
+        data["duration"] = parse_duration(target.get("duration")) or data["duration"]
+        image = target.get("image")
+        if isinstance(image, list):
+            image = image[0] if image else None
+        data["cover"] = clean(image) or data["cover"]
+        pub = target.get("publisher")
+        if isinstance(pub, dict):
+            pub = pub.get("name")
+        data["publisher"] = clean(pub) or data["publisher"]
+        genre = target.get("genre")
+        if isinstance(genre, list):
+            data["genres"] = [clean(x) for x in genre if clean(x)]
+        elif genre:
+            data["genres"] = [clean(genre)]
+
     try:
-        desc = page.locator("#book-description").first
-        if await desc.count():
-            value = clean(await desc.text_content())
+        description = page.locator("#book-description").first
+        if await description.count():
+            await description.wait_for(state="attached", timeout=2500)
+            value = clean(await description.text_content())
             if value:
                 data["description"] = value
                 print(f"[Lubimyczytać] description: chars={len(value)} type={data['type']} url={data['url']}")
     except Exception:
         pass
 
-    for selector in ("a#js-lightboxCover[href]", ".book-cover__link[href]", "meta[property='og:image']", "meta[name='twitter:image']", "img.book-cover[src]"):
+    # The product page is authoritative for its own cover.
+    for selector in (
+        "a#js-lightboxCover[href]",
+        ".book-cover__link[href]",
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+        "meta[itemprop='image']",
+        "img.book-cover[src]",
+    ):
         try:
             loc = page.locator(selector).first
-            if await loc.count():
-                value = clean(await loc.get_attribute("href") or await loc.get_attribute("content") or await loc.get_attribute("src"))
-                if value:
-                    data["cover"] = value
-                    break
+            if not await loc.count():
+                continue
+            value = clean(await loc.get_attribute("href") or await loc.get_attribute("content") or await loc.get_attribute("src"))
+            if value:
+                if value.startswith("/"):
+                    value = BASE + value
+                data["cover"] = value
+                break
         except Exception:
             pass
 
-    if not data["author"]:
-        names = [clean(x) for x in await page.locator("a[href*='/autor/']").all_text_contents() if clean(x)]
-        if names:
-            data["author"] = ", ".join(dict.fromkeys(names[:5]))
+    # Keep the search-card author unless the detail page explicitly provides a
+    # better author value. This protects the known audiobook result.
+    detail_authors = []
+    for selector in ("a.book__author", ".book__authors a[href*='/autor/']"):
+        try:
+            detail_authors += [clean(x) for x in await page.locator(selector).all_text_contents() if clean(x)]
+        except Exception:
+            pass
+    if detail_authors:
+        data["author"] = ", ".join(dict.fromkeys(detail_authors[:5]))
 
-    data["publisher"] = data["publisher"] or label_value(lines, ["Wydawca", "Wydawnictwo"])
-    data["publishedYear"] = data["publishedYear"] or parse_year(label_value(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
-    data["isbn"] = data["isbn"] or label_value(lines, ["ISBN"])
-    data["duration"] = data["duration"] or parse_duration(label_value(lines, ["Czas czytania", "Długość", "Czas trwania"]))
-    data["narrator"] = label_value(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
-    language = label_value(lines, ["Język"])
+    data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
+    data["publishedYear"] = data["publishedYear"] or parse_year(value_after_label(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
+    data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
+    data["duration"] = data["duration"] or parse_duration(value_after_label(lines, ["Czas czytania", "Długość", "Czas trwania"]))
+    data["narrator"] = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"]) or data["narrator"]
+    language = value_after_label(lines, ["Język"])
     data["language"] = "pol" if not language or norm(language) in {"polski", "polska", "pol"} else norm(language)
-    category = label_value(lines, ["Kategoria", "Kategorie"])
+    category = value_after_label(lines, ["Kategoria", "Kategorie"])
     if category:
         data["genres"] = [clean(x) for x in re.split(r"[,;/]", category) if clean(x)]
     data["series"], data["sequence"] = series_from_lines(lines)
+
     if not data["isbn"]:
         m = re.search(r"\b(97[89]\d{10})\b", body)
-        if m:
-            data["isbn"] = m.group(1)
+        data["isbn"] = m.group(1) if m else None
     return data
 
 
-def candidate_score(candidate, query, author):
-    title_s = similarity(candidate.get("title"), query)
-    authors = candidate.get("authors") or []
-    author_s = max([similarity(x, author) for x in authors], default=0.0) if author else 1.0
-    # Do not eliminate a candidate just because the search card omitted author;
-    # the detail page is authoritative. Give it a neutral author score.
-    if author and not authors:
-        author_s = 0.5
-    return (title_s * 0.60 + author_s * 0.40) if author else title_s
-
-
-def final_score(data, query, author):
-    title_s = similarity(data.get("title"), query)
-    author_s = similarity(data.get("author"), author) if author else 1.0
-    if author and author_s < 0.25:
-        return 0.0
-    value = title_s * 0.60 + author_s * 0.40 if author else title_s
+def score(data, query, author):
+    title_score = similarity(data.get("title"), query)
+    author_score = similarity(data.get("author"), author) if author else 1.0
+    if author and not data.get("author"):
+        author_score = 0.5
+    value = title_score * 0.60 + author_score * 0.40 if author else title_score
+    if author and author_score < 0.25:
+        return 0.0, title_score, author_score
     if not data.get("isbn"):
         value *= 0.99
     if data.get("type") == "audiobook":
         value += 0.001
-    return min(value, 1.0)
+    return min(value, 1.0), title_score, author_score
 
 
 def to_match(data, value):
     return {
-        "title": data.get("title"), "author": data.get("author"),
-        "narrator": data.get("narrator"), "publisher": data.get("publisher"),
-        "publishedYear": data.get("publishedYear"), "description": data.get("description"),
-        "cover": data.get("cover"), "isbn": data.get("isbn"),
+        "title": data.get("title"),
+        "author": data.get("author"),
+        "narrator": data.get("narrator"),
+        "publisher": data.get("publisher"),
+        "publishedYear": data.get("publishedYear"),
+        "description": data.get("description"),
+        "cover": data.get("cover"),
+        "isbn": data.get("isbn"),
         "genres": data.get("genres") or None,
         "series": ([{"series": data["series"], "sequence": data.get("sequence")}] if data.get("series") else None),
-        "language": data.get("language", "pol"), "duration": data.get("duration"),
-        "type": data.get("type", "book"), "similarity": round(value, 3),
+        "language": data.get("language", "pol"),
+        "duration": data.get("duration"),
+        "type": data.get("type", "book"),
+        "similarity": round(value, 3),
     }
 
 
@@ -318,12 +361,12 @@ async def lubimyczytac_search(query, author=""):
     context = await get_context()
     search = await context.new_page()
     try:
-        queries = [(query, "ksiazki"), (query, "audiobooki")]
+        book_cards = await search_page(search, query, "ksiazki")
+        audiobook_cards = await search_page(search, query, "audiobooki")
+        collected = book_cards + audiobook_cards
         if author:
-            queries += [(f"{query} {author}", "ksiazki"), (f"{query} {author}", "audiobooki")]
-        collected = []
-        for q, section in queries:
-            collected.extend(await search_page(search, q, section))
+            collected += await search_page(search, f"{query} {author}", "ksiazki")
+            collected += await search_page(search, f"{query} {author}", "audiobooki")
     finally:
         await search.close()
 
@@ -331,36 +374,54 @@ async def lubimyczytac_search(query, author=""):
     for item in collected:
         unique.setdefault(item["url"], item)
     candidates = list(unique.values())
+
     for item in candidates:
+        title_s = similarity(item.get("title"), query)
+        authors = item.get("authors") or []
+        author_s = max((similarity(x, author) for x in authors), default=0.5) if author else 1.0
         item["query"] = query
-        item["pre_score"] = candidate_score(item, query, author)
+        item["pre_score"] = title_s * 0.60 + author_s * 0.40 if author else title_s
+
     candidates.sort(key=lambda x: (x["pre_score"], 1 if x["type"] == "audiobook" else 0), reverse=True)
     candidates = candidates[:30]
     print(f"[Lubimyczytać] candidates to parse: {len(candidates)}")
 
     sem = asyncio.Semaphore(8)
-    results = []
-    async def one(candidate):
+
+    async def parse_one(candidate):
         async with sem:
             page = await context.new_page()
             try:
-                data = await asyncio.wait_for(parse_detail(page, candidate), timeout=20)
-                value = final_score(data, query, author)
-                if value > 0:
-                    results.append((value, data))
-                    print(f"[Lubimyczytać] parsed: {data.get('title')} / {data.get('author')} type={data.get('type')} score={value:.3f} url={data.get('url')}")
+                return await parse_detail(page, candidate)
             except Exception as exc:
-                print(f"[Lubimyczytać] detail failed {candidate['url']}: {type(exc).__name__}: {exc}")
+                print(f"[Lubimyczytać] detail failed: {candidate['url']} {type(exc).__name__}: {exc}")
+                return None
             finally:
                 await page.close()
-    await asyncio.gather(*(one(x) for x in candidates))
 
-    results.sort(key=lambda x: (x[0], 1 if norm(x[1].get("title")) == norm(query) else 0, 1 if x[1].get("type") == "audiobook" else 0), reverse=True)
-    matches = [to_match(data, value) for value, data in results[:MAX_RESULTS]]
-    result = {"matches": matches}
+    parsed = await asyncio.gather(*(parse_one(c) for c in candidates))
+    ranked = []
+    for data in parsed:
+        if not data:
+            continue
+        value, title_s, author_s = score(data, query, author)
+        if value <= 0:
+            continue
+        ranked.append((value, title_s, author_s, data))
+        print(f"[Lubimyczytać] parsed: {data.get('title')} / {data.get('author')} type={data.get('type')} score={value:.3f} url={data.get('url')}")
+
+    ranked.sort(key=lambda x: (x[0], 1 if x[3].get("type") == "audiobook" else 0, x[1], x[2]), reverse=True)
+    final = [to_match(data, value) for value, _, _, data in ranked[:MAX_RESULTS]]
+    print("[Lubimyczytać] final:", " | ".join(f"{x['title']}/{x.get('author')} [{x['type']}] ({x['similarity']:.3f})" for x in final))
+
+    result = {"matches": final}
     _cache[key] = (time.time(), result)
-    print("[Lubimyczytać] final:", " | ".join(f"{x['title']}/{x.get('author')} [{x['type']}] ({x['similarity']:.3f})" for x in matches))
     return result
+
+
+@app.get("/health")
+async def health():
+    return {"status": "ok", "provider": "lubimyczytac"}
 
 
 @app.get("/search")
@@ -370,11 +431,6 @@ async def search(query: str = Query(..., min_length=1), author: str = Query(""),
     return JSONResponse(await lubimyczytac_search(query, author))
 
 
-@app.get("/health")
-async def health():
-    return {"status": "ok", "provider": "lubimyczytac-pl"}
-
-
 @app.on_event("shutdown")
 async def shutdown():
     global _context, _browser, _pw
@@ -382,5 +438,7 @@ async def shutdown():
         await _context.close()
     if _browser:
         await _browser.close()
+    if _pw:
+        await _browser.close() if _browser else None
     if _pw:
         await _pw.stop()
