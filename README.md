@@ -133,6 +133,8 @@ Dane są pobierane ze strony właściwego produktu, dzięki czemu wynik może za
 
 Provider BookBeat obsługuje polski katalog BookBeat i wyszukuje audiobooki po tytule oraz autorze. Wyniki są następnie sprawdzane na stronie konkretnego produktu.
 
+Dane szczegółowe są pobierane z wyrenderowanej strony produktu, dzięki czemu provider może korzystać z metadanych, które nie są dostępne bezpośrednio w wynikach wyszukiwania.
+
 Obsługiwane są między innymi:
 
 - tytuł i autor;
@@ -148,6 +150,14 @@ Obsługiwane są między innymi:
 - czas trwania audiobooka.
 
 BookBeat może udostępniać ten sam tytuł jako audiobook i e-book. Provider dla Audiobookshelf korzysta z danych wydania audiobookowego, jeśli są dostępne, dzięki czemu np. czas trwania, ISBN i wydawca dotyczą właściwego wydania.
+
+### Rozwijanie pełnych metadanych
+
+Na stronie produktu BookBeat część dodatkowych informacji jest domyślnie ukryta za przyciskiem **„Pokaż więcej”**. Provider automatycznie rozwija tę sekcję przed odczytem metadanych.
+
+Obsługiwany jest również ekran zgody OneTrust. Provider próbuje zamknąć warstwę zgody przed dalszym przetwarzaniem strony, dzięki czemu overlay nie blokuje rozwijania metadanych.
+
+Nie jest wykonywane drugie kliknięcie **„Pokaż więcej”** — zapobiega to ponownemu zwinięciu sekcji i regresji przy kolejnym żądaniu do Audiobookshelf.
 
 Opis oraz szczegółowe informacje są pobierane ze strony produktu, a nie z samej listy wyszukiwania. Dzięki temu wynik może zawierać również pełniejsze informacje o obsadzie, lektorze, serii i wydaniu.
 
@@ -203,7 +213,7 @@ Provider Lubimyczytać Polska — wyszukiwanie książek i audiobooków oraz pob
 
 ### `bookbeat_provider.py`
 
-Provider BookBeat Polska — wyszukiwanie oraz pobieranie metadanych audiobooków ze stron produktów.
+Provider BookBeat Polska — wyszukiwanie oraz pobieranie metadanych audiobooków ze stron produktów, z obsługą zgody OneTrust i rozwijania ukrytych metadanych.
 
 ### `nginx.conf`
 
