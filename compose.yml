@@ -1,8 +1,28 @@
 services:
-  polskie-meta-abs:
-    build: .
-    container_name: polskie-meta-abs
+  storytel-pl:
+    build:
+      context: .
+      args:
+        SERVICE_PORT: 3000
+        PROVIDER_NAME: storytel
+    container_name: polskie-meta-storytel
     restart: unless-stopped
+    environment:
+      PROVIDER: storytel
+      PORT: 3000
     ports:
       - "3000:3000"
+
+  audioteka-pl:
+    build:
+      context: .
+      args:
+        SERVICE_PORT: 3001
+        PROVIDER_NAME: audioteka
+    container_name: polskie-meta-audioteka
+    restart: unless-stopped
+    environment:
+      PROVIDER: audioteka
+      PORT: 3001
+    ports:
       - "3001:3001"
