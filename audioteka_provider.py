@@ -153,8 +153,8 @@ async def search_urls(page, query):
     url = f"{SEARCH}?phrase={quote(query)}"
     print(f"[Audioteka] search: {url}")
     await goto(page, url, 1400)
-    for _ in range(5):
-        await page.mouse.wheel(0, 1600)
+    for _ in range(6):
+        await page.mouse.wheel(0, 1800)
         await page.wait_for_timeout(300)
     urls = await collect_links(page)
     print(f"[Audioteka] search '{query}' -> {len(urls)} product/series URLs")
@@ -164,18 +164,19 @@ async def search_urls(page, query):
 async def direct_candidates(page, query):
     slug = slugify(query)
     candidates = [
+        f"{PL}/cykl/{slug}-audioserial/",
         f"{PL}/audiobook/{slug}/",
         f"{PL}/cykl/{slug}/",
-        f"{PL}/cykl/{slug}-audioserial/",
         f"{PL}/audiobook/{slug}-audioserial/",
     ]
     found = []
     for url in candidates:
         try:
-            await goto(page, url, 500)
+            await goto(page, url, 600)
             final = canonical(page.url)
             title = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
-            if page.url.startswith(BASE) and title and "404" not in (await page.title()).lower() and "nie znaleziono" not in title.lower():
+            body = clean(await page.locator("body").inner_text()) or ""
+            if page.url.startswith(BASE) and title and "404" not in (await page.title()).lower() and "nie znaleziono" not in body.lower():
                 found.append(final)
                 print(f"[Audioteka] direct candidate: {final}")
         except Exception as exc:
@@ -185,7 +186,7 @@ async def direct_candidates(page, query):
 
 def extract_label(text, labels):
     label = "(?:" + "|".join(labels) + ")"
-    m = re.search(rf"{label}\s*[:\-]?\s*(.+?)(?=\s+(?:Głosy|Lektor|Czyta|Autor|Wydawca|Długość|Typ|Format|Język|Opis|Kategoria|Kolekcje)\b|$)", text, re.I)
+    m = re.search(rf"{label}\s*[:\-]?\s*(.+?)(?=\s+(?:Głosy|Lektor|Czyta|Autor|Wydawca|Długość|Typ|Format|Język|Opis|Kategoria|Kolekcje|Dostępne)\b|$)", text, re.I)
     return clean(m.group(1)) if m else None
 
 
@@ -247,8 +248,8 @@ async def parse_page(page, url, series_hint=False, collect_page_links=False):
     isbn = isbn or (isbn_match.group(1) if isbn_match else None)
     published = published or year(text)
     duration = duration or duration_minutes(text)
-
     links = await collect_links(page) if collect_page_links else []
+
     return {
         "title": title,
         "author": author,
@@ -286,10 +287,7 @@ async def enrich_series(ctx, data):
 async def parse_candidate(ctx, url):
     page = await ctx.new_page()
     try:
-        if is_series(url):
-            data = await parse_page(page, url, series_hint=True, collect_page_links=True)
-        else:
-            data = await parse_page(page, url, collect_page_links=False)
+        data = await parse_page(page, url, series_hint=is_series(url), collect_page_links=is_series(url))
     finally:
         await page.close()
     if is_series(url):
@@ -302,10 +300,14 @@ def score_book(book, query, author):
     author_score = sim(book.get("author"), author) if author else 1.0
     if author and not book.get("author"):
         author_score = 0.60
+    # Audioteka often appends ". Audioserial" to the collection title.
+    # Strip that semantic suffix for an additional exact-title boost.
+    cleaned_title = re.sub(r"\s*[.:-]?\s*audioserial\b", "", book.get("title") or "", flags=re.I)
+    clean_title_score = sim(cleaned_title, query)
+    title_score = max(title_score, clean_title_score)
     score = title_score * 0.78 + author_score * 0.22 if author else title_score
-    # Exact audioserial slug/title match gets priority over generic results.
-    if book.get("series") and title_score >= 0.90:
-        score += 0.03
+    if book.get("series") and clean_title_score >= 0.90:
+        score += 0.05
     return min(score, 1.0)
 
 
@@ -318,9 +320,6 @@ async def audioteka_search(query, author=""):
     ctx = await browser_context()
     page = await ctx.new_page()
     try:
-        # For short/common queries (e.g. "Siostry"), search first and then
-        # explicitly try the audioserial slug. This catches /cykl/*-audioserial/
-        # even when the search UI does not expose the series card.
         urls = await search_urls(page, query)
         direct = await direct_candidates(page, query)
         urls = list(dict.fromkeys(direct + urls))
@@ -333,12 +332,13 @@ async def audioteka_search(query, author=""):
     query_n = norm(query)
     def priority(u):
         path_n = norm(urlparse(u).path)
-        exact_slug = query_n and query_n.replace(" ", "-") in path_n
-        return (0 if exact_slug else 1, 0 if is_series(u) else 1)
-    urls = sorted(urls, key=priority)
-    urls = list(dict.fromkeys(urls))[:12]
+        exact_slug = query_n.replace(" ", "-") in path_n
+        audioserial = "audioserial" in path_n
+        return (0 if exact_slug else 1, 0 if audioserial else 1, 0 if is_series(u) else 1)
 
+    urls = list(dict.fromkeys(sorted(urls, key=priority)))[:12]
     print(f"[Audioteka] candidates to parse: {len(urls)}")
+
     books = []
     for url in urls:
         try:
@@ -352,6 +352,8 @@ async def audioteka_search(query, author=""):
     ranked = []
     for book in books:
         title_score = sim(book.get("title"), query)
+        cleaned_title = re.sub(r"\s*[.:-]?\s*audioserial\b", "", book.get("title") or "", flags=re.I)
+        title_score = max(title_score, sim(cleaned_title, query))
         author_score = sim(book.get("author"), author) if author else 1.0
         if title_score < 0.45:
             continue
