@@ -8,10 +8,10 @@ RUN pip install --no-cache-dir -r requirements.txt \
     && apt-get install -y --no-install-recommends nginx \
     && rm -rf /var/lib/apt/lists/*
 
-COPY scraper.py nginx.conf ./
+COPY scraper.py audioteka_provider.py nginx.conf ./
 
 ENV PYTHONUNBUFFERED=1
 
 EXPOSE 3000 3001
 
-CMD ["sh", "-c", "uvicorn scraper:app --host 127.0.0.1 --port 8000 & nginx -c /app/nginx.conf -g 'daemon off;' & wait"]
+CMD ["sh", "-c", "uvicorn scraper:app --host 127.0.0.1 --port 8000 & uvicorn audioteka_provider:app --host 127.0.0.1 --port 8001 & nginx -c /app/nginx.conf -g 'daemon off;' & wait"]
