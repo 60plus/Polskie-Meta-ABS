@@ -112,6 +112,60 @@ def first_person_name(value):
     return clean(value)
 
 
+def jsonld_type(item):
+    value = item.get("@type")
+    if isinstance(value, list):
+        return {str(x).lower() for x in value}
+    return {str(value).lower()} if value else set()
+
+
+def extract_lines(text):
+    return [clean(x) for x in str(text or "").splitlines() if clean(x)]
+
+
+def extract_line_value(lines, labels):
+    wanted = {norm(x) for x in labels}
+    for i, line in enumerate(lines):
+        if norm(line) not in wanted:
+            continue
+        for candidate in lines[i + 1:i + 5]:
+            if not candidate or norm(candidate) in wanted:
+                continue
+            if len(candidate) <= 180:
+                return candidate
+    return None
+
+
+def extract_names_after_label(lines, labels, stop_labels, max_names=8):
+    wanted = {norm(x) for x in labels}
+    stops = {norm(x) for x in stop_labels}
+    for i, line in enumerate(lines):
+        if norm(line) not in wanted:
+            continue
+        names = []
+        for candidate in lines[i + 1:]:
+            n = norm(candidate)
+            if n in stops:
+                break
+            if len(candidate) <= 100 and candidate not in names:
+                names.append(candidate)
+            if len(names) >= max_names:
+                break
+        return ", ".join(names) if names else None
+    return None
+
+
+def extract_isbn(text):
+    match = re.search(r"\b(97[89]\d{10})\b", text or "")
+    return match.group(1) if match else None
+
+
+def extract_title_from_url(url):
+    slug = urlparse(url).path.rstrip("/").split("/")[-1]
+    slug = re.sub(r"-audioserial$", "", slug, flags=re.I)
+    return slug.replace("-", " ").strip().title() if slug else None
+
+
 async def get_context():
     global _pw, _browser, _context
     async with _browser_lock:
@@ -135,11 +189,10 @@ async def get_context():
 async def open_page(page, url, wait=1000):
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
     try:
-        await page.wait_for_load_state("networkidle", timeout=5000)
+        await page.wait_for_load_state("networkidle", timeout=7000)
     except Exception:
         pass
     await page.wait_for_timeout(wait)
-
     for text in ("Akceptuję", "Zgadzam się", "Zaakceptuj"):
         try:
             button = page.get_by_role("button", name=re.compile(text, re.I)).first
@@ -174,12 +227,9 @@ async def search_page(page, query):
     url = f"{SEARCH}?phrase={quote(query)}"
     print(f"[Audioteka] search: {url}")
     await open_page(page, url, 1200)
-
-    # Audioteka search results can be lazy-loaded.
     for _ in range(5):
         await page.mouse.wheel(0, 1800)
         await page.wait_for_timeout(250)
-
     urls = await page_links(page)
     print(f"[Audioteka] search '{query}' -> {len(urls)} product/series URLs")
     return urls
@@ -199,9 +249,8 @@ async def direct_urls(page, query):
             await open_page(page, candidate, 500)
             current = canonical(page.url)
             title = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
-            body = clean(await page.locator("body").inner_text()) or ""
             page_title = (await page.title()).lower()
-            if page.url.startswith(BASE) and title and "404" not in page_title and "nie znaleziono" not in body.lower():
+            if page.url.startswith(BASE) and title and "404" not in page_title and "nie znaleziono" not in page_title:
                 if is_audiobook(current) or is_series(current):
                     found.append(current)
                     print(f"[Audioteka] direct candidate: {current}")
@@ -210,26 +259,12 @@ async def direct_urls(page, query):
     return list(dict.fromkeys(found))
 
 
-def extract_label(text, labels):
-    label = "(?:" + "|".join(labels) + ")"
-    match = re.search(
-        rf"{label}\s*[:\-]?\s*(.+?)(?=\s+(?:Głosy|Lektor|Czyta|Autor|Autorzy|Wydawca|Długość|Język|Opis|Kategoria|Dostępne|Format)\b|$)",
-        text,
-        re.I,
-    )
-    return clean(match.group(1)) if match else None
-
-
-def extract_title_from_url(url):
-    slug = urlparse(url).path.rstrip("/").split("/")[-1]
-    slug = re.sub(r"-audioserial$", "", slug, flags=re.I)
-    return slug.replace("-", " ").strip().title() if slug else None
-
-
 async def parse_product(page, url, query, author=""):
     await open_page(page, url, 700)
-    body = clean(await page.locator("body").inner_text()) or ""
-    text = re.sub(r"\s+", " ", body)
+    body = await page.locator("body").inner_text()
+    text = re.sub(r"\s+", " ", clean(body) or "")
+    lines = extract_lines(body)
+    series_page = is_series(url)
 
     data = {
         "title": None,
@@ -244,68 +279,102 @@ async def parse_product(page, url, query, author=""):
         "genres": [],
         "series": None,
         "url": canonical(url),
-        "is_series": is_series(url),
+        "is_series": series_page,
     }
 
-    # JSON-LD is more reliable than the visible H1 on Audioteka series pages.
+    candidates = []
     for raw in await page.locator("script[type='application/ld+json']").all_text_contents():
-        for item in jsonld_objects(raw):
-            item_type = str(item.get("@type", "")).lower()
-            name = clean(item.get("name"))
-            if name and (not data["title"] or item_type in ("book", "audiobook", "product")):
-                data["title"] = name
-            data["description"] = data["description"] or clean(item.get("description"))
-            data["isbn"] = data["isbn"] or clean(item.get("isbn"))
-            data["publishedYear"] = data["publishedYear"] or parse_year(item.get("datePublished"))
-            data["duration"] = data["duration"] or parse_duration(item.get("duration"))
-            image = item.get("image")
-            if isinstance(image, list):
-                image = image[0] if image else None
-            data["cover"] = data["cover"] or clean(image)
-            publisher = item.get("publisher")
-            if isinstance(publisher, dict):
-                publisher = publisher.get("name")
-            data["publisher"] = data["publisher"] or clean(publisher)
-            data["author"] = data["author"] or first_person_name(item.get("author"))
-            data["narrator"] = data["narrator"] or first_person_name(item.get("readBy"))
-            data["narrator"] = data["narrator"] or first_person_name(item.get("actor"))
-            genre = item.get("genre")
-            if isinstance(genre, list):
-                data["genres"].extend(clean(x) for x in genre)
-            elif genre:
-                data["genres"].append(clean(genre))
+        candidates.extend(jsonld_objects(raw))
 
-    # og:* is a useful fallback for covers/descriptions.
-    for selector, key in (("meta[property='og:title']", "title"), ("meta[property='og:description']", "description"), ("meta[property='og:image']", "cover")):
+    target = None
+    for item in candidates:
+        types = jsonld_type(item)
+        name = clean(item.get("name"))
+        if not name:
+            continue
+        product_like = bool(types & {"product", "book", "audiobook", "creativework", "audiobookseries"})
+        if not product_like:
+            continue
+        if similarity(strip_audioserial(name), query) >= 0.70:
+            target = item
+            break
+        if target is None:
+            target = item
+
+    if target:
+        data["title"] = clean(target.get("name"))
+        data["description"] = clean(target.get("description"))
+        data["isbn"] = clean(target.get("isbn")) or extract_isbn(text)
+        data["publishedYear"] = parse_year(target.get("datePublished"))
+        data["duration"] = parse_duration(target.get("duration"))
+        image = target.get("image")
+        if isinstance(image, list):
+            image = image[0] if image else None
+        data["cover"] = clean(image)
+        publisher = target.get("publisher")
+        if isinstance(publisher, dict):
+            publisher = publisher.get("name")
+        data["publisher"] = clean(publisher)
+        data["author"] = first_person_name(target.get("author"))
+        data["narrator"] = first_person_name(target.get("readBy")) or first_person_name(target.get("actor"))
+        genre = target.get("genre")
+        if isinstance(genre, list):
+            data["genres"] = [clean(x) for x in genre if clean(x)]
+        elif genre:
+            data["genres"] = [clean(genre)]
+
+    h1 = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
+    og_title = None
+    og_description = None
+    og_image = None
+    for selector, key in (
+        ("meta[property='og:title']", "og_title"),
+        ("meta[property='og:description']", "og_description"),
+        ("meta[property='og:image']", "og_image"),
+    ):
         try:
             value = clean(await page.locator(selector).get_attribute("content"))
-            if value and not data[key]:
-                data[key] = value
+            if key == "og_title":
+                og_title = value
+            elif key == "og_description":
+                og_description = value
+            else:
+                og_image = value
         except Exception:
             pass
 
-    # Visible page fallbacks.
-    if not data["title"] or (data["is_series"] and data["title"] in {"Cały sezon już dostępny!", "Cały sezon już dostępny"}):
-        data["title"] = query
-    if not data["author"]:
-        data["author"] = extract_label(text, ["Autor", "Autorzy", "Scenariusz"])
-    if not data["publisher"]:
-        data["publisher"] = extract_label(text, ["Wydawca"])
-    if not data["narrator"]:
-        data["narrator"] = extract_label(text, ["Głosy", "Lektor", "Czyta"])
-    data["publishedYear"] = data["publishedYear"] or parse_year(text)
-    data["duration"] = data["duration"] or parse_duration(text)
+    if series_page:
+        if og_title and similarity(strip_audioserial(og_title), query) >= 0.70:
+            data["title"] = strip_audioserial(og_title)
+        else:
+            data["title"] = query or extract_title_from_url(url)
+    else:
+        data["title"] = h1 or og_title or data["title"] or extract_title_from_url(url) or query
 
-    if author and not data["author"]:
+    if data["title"] in {"Cały sezon już dostępny!", "Cały sezon już dostępny"}:
+        data["title"] = query or extract_title_from_url(url)
+
+    data["description"] = data["description"] or og_description
+    data["cover"] = data["cover"] or og_image
+    data["author"] = data["author"] or extract_line_value(lines, ["Autor", "Autorzy", "Scenariusz"])
+    data["publisher"] = data["publisher"] or extract_line_value(lines, ["Wydawca"])
+    data["narrator"] = data["narrator"] or extract_names_after_label(
+        lines,
+        ["Głosy", "Lektor", "Czyta"],
+        ["Długość", "Wydawca", "Typ", "Format", "Język", "Kategoria", "Opis"],
+    )
+    data["duration"] = data["duration"] or parse_duration(text)
+    data["publishedYear"] = data["publishedYear"] or parse_year(text)
+    data["isbn"] = data["isbn"] or extract_isbn(text)
+
+    if series_page and author:
+        data["author"] = author
+    elif not data["author"] and author:
         data["author"] = author
 
-    # For a series, the search query is the canonical user-facing title.
-    if data["is_series"]:
-        data["series"] = query
-        data["title"] = query
-
-    if not data["cover"]:
-        data["cover"] = None
+    if series_page:
+        data["series"] = data["title"]
+        data["title"] = query or data["title"]
 
     return data
 
@@ -318,7 +387,6 @@ def score(data, query, author):
     author_score = similarity(data.get("author"), author) if author else 1.0
     if author and not data.get("author"):
         author_score = 0.55
-
     result = title_score * 0.78 + author_score * 0.22 if author else title_score
     if data.get("is_series") and title_score >= 0.90:
         result += 0.10
@@ -343,51 +411,59 @@ async def audioteka_search(query, author=""):
     finally:
         await page.close()
 
-    # Exact direct candidates and audioserial collections go first.
     qslug = slugify(query)
+
     def url_priority(url):
         path = urlparse(url).path.lower()
         exact = qslug in path
         return (
             0 if exact else 1,
-            0 if "audioserial" in path else 1,
             0 if is_series(url) else 1,
+            0 if "audioserial" in path else 1,
         )
 
-    urls = sorted(urls, key=url_priority)[:10]
+    urls = sorted(urls, key=url_priority)[:12]
     print(f"[Audioteka] candidates to parse: {len(urls)}")
 
     parsed = []
     for url in urls:
         page = await context.new_page()
         try:
-            data = await asyncio.wait_for(parse_product(page, url, query, author), timeout=20)
+            data = await asyncio.wait_for(parse_product(page, url, query, author), timeout=30)
             if data.get("title"):
                 data["similarity"] = round(score(data, query, author), 4)
                 parsed.append(data)
                 print(
                     f"[Audioteka] parsed: {data['title']} / {data.get('author')} "
-                    f"series={data.get('is_series')} score={data['similarity']:.3f}"
+                    f"series={data.get('is_series')} score={data['similarity']:.3f} url={url}"
                 )
         except Exception as exc:
             print(f"[Audioteka] parse failed {url}: {type(exc).__name__}: {exc}")
         finally:
             await page.close()
 
-    # Author is a hard filter when Audiobookshelf supplies it and the page has an author.
     filtered = []
     for data in parsed:
-        if data["similarity"] < 0.45:
+        title_score = similarity(data.get("title"), query)
+        if title_score < 0.45:
             continue
         if author and data.get("author") and similarity(data["author"], author) < 0.40:
             continue
         filtered.append(data)
 
-    # Prefer an exact series/product over generic homonyms.
     filtered.sort(key=lambda x: x["similarity"], reverse=True)
 
+    unique = []
+    seen = set()
+    for data in filtered:
+        key_url = data.get("url")
+        if key_url in seen:
+            continue
+        seen.add(key_url)
+        unique.append(data)
+
     matches = []
-    for data in filtered[:MAX_RESULTS]:
+    for data in unique[:MAX_RESULTS]:
         matches.append({
             "title": data.get("title"),
             "author": data.get("author"),
