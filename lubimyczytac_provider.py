@@ -5,11 +5,13 @@ import time
 import unicodedata
 from difflib import SequenceMatcher
 from urllib.parse import quote, urljoin, urlparse
+from urllib.request import Request, urlopen
+from urllib.error import HTTPError, URLError
 
 from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
-from playwright.async_api import async_playwright
+from playwright.async_api import async_playwright, Error as PlaywrightError
 
 app = FastAPI(title="LubimyCzytać Metadata Provider")
 BASE = "https://lubimyczytac.pl"
@@ -53,10 +55,7 @@ def similarity(a, b):
 
 def canonical(url):
     parsed = urlparse(url)
-    # Do not manufacture a trailing slash: audiobook pages are especially
-    # sensitive to the exact canonical URL returned by the search page.
-    path = parsed.path.rstrip("/")
-    return urljoin(BASE, path + "/")
+    return urljoin(BASE, parsed.path.rstrip("/") + "/")
 
 
 def is_product_url(url):
@@ -76,6 +75,8 @@ def parse_year(value):
 
 def parse_duration(value):
     text = str(value or "")
+    if not text:
+        return None
     h = re.search(r"(\d+)\s*(?:godz\.?|godziny|godzin|h)\b", text, re.I)
     m = re.search(r"(\d+)\s*(?:min\.?|minut|m)\b", text, re.I)
     if h:
@@ -90,33 +91,10 @@ def lines_from_body(body):
 def value_after_label(lines, labels):
     wanted = {norm(x).rstrip(":") for x in labels}
     for i, line in enumerate(lines):
-        current = norm(line).rstrip(":")
-        if current in wanted:
-            for candidate in lines[i + 1:i + 8]:
+        if norm(line).rstrip(":") in wanted:
+            for candidate in lines[i + 1:i + 6]:
                 if candidate and norm(candidate).rstrip(":") not in wanted:
                     return candidate
-    return None
-
-
-def text_after_heading(soup, labels):
-    wanted = {norm(x).rstrip(":") for x in labels}
-    for node in soup.find_all(["dt", "div", "span", "strong", "h2", "h3", "h4"]):
-        text = clean(node.get_text(" ", strip=True))
-        if not text:
-            continue
-        n = norm(text).rstrip(":")
-        if n in wanted:
-            nxt = node.find_next_sibling()
-            if nxt:
-                value = clean(nxt.get_text(" ", strip=True))
-                if value and norm(value).rstrip(":") not in wanted:
-                    return value
-            parent = node.parent
-            if parent:
-                value = clean(parent.get_text(" ", strip=True))
-                value = re.sub(r"^\s*[^:]{1,80}:\s*", "", value)
-                if value and norm(value).rstrip(":") not in wanted:
-                    return value
     return None
 
 
@@ -153,6 +131,17 @@ def jsonld_value(obj, *keys):
     return None
 
 
+def static_get(url, timeout=10):
+    request = Request(url, headers=HEADERS)
+    with urlopen(request, timeout=timeout) as response:
+        return response.read(), response.headers.get_content_charset() or "utf-8"
+
+
+def parse_static_detail(html_bytes, encoding="utf-8"):
+    html = html_bytes.decode(encoding, errors="replace")
+    return BeautifulSoup(html, "html.parser")
+
+
 async def get_context():
     global _pw, _browser, _context
     async with _lock:
@@ -173,13 +162,31 @@ async def get_context():
         return _context
 
 
-async def open_page(page, url, wait=150):
-    await page.goto(url, wait_until="domcontentloaded", timeout=30000)
-    try:
-        await page.wait_for_load_state("networkidle", timeout=2500)
-    except Exception:
-        pass
-    await page.wait_for_timeout(wait)
+async def open_page(page, url, wait=150, retries=3):
+    last_error = None
+    for attempt in range(1, retries + 1):
+        try:
+            await page.goto(url, wait_until="commit", timeout=30000)
+            try:
+                await page.wait_for_load_state("domcontentloaded", timeout=10000)
+            except Exception:
+                pass
+            try:
+                await page.wait_for_load_state("networkidle", timeout=2500)
+            except Exception:
+                pass
+            await page.wait_for_timeout(wait)
+            return True
+        except PlaywrightError as exc:
+            last_error = exc
+            message = str(exc)
+            print(f"[Lubimyczytać] navigation attempt {attempt}/{retries} failed: {type(exc).__name__}: {message}")
+            if "ERR_ABORTED" not in message and "ERR_CONNECTION" not in message:
+                raise
+            await asyncio.sleep(0.5 * attempt)
+    if last_error:
+        raise last_error
+    return False
 
 
 async def first_image_url(scope):
@@ -208,7 +215,11 @@ async def search_page(page, query, author, section, result_type):
     if author:
         url += f"&author={quote(author)}"
     print(f"[Lubimyczytać] search: {url}")
-    await open_page(page, url, 150)
+    try:
+        await open_page(page, url, 150)
+    except Exception as exc:
+        print(f"[Lubimyczytać] search navigation failed: {type(exc).__name__}: {exc}")
+        return []
 
     found, seen = [], set()
     cards = page.locator(".book-card--l")
@@ -243,7 +254,6 @@ async def search_page(page, query, author, section, result_type):
         except Exception:
             continue
 
-    # Search result pages can contain audiobook links nested in otherwise book-like cards.
     selector = "a[href*='/audiobook/']" if result_type == "audiobook" else "a[href*='/ksiazka/']"
     links = page.locator(selector)
     for i in range(min(await links.count(), 50)):
@@ -293,53 +303,30 @@ def static_meta(soup, selector):
 def parse_static_metadata(soup, candidate):
     media_type = "audiobook" if "/audiobook/" in candidate["url"] else candidate.get("type", "book")
     data = {
-        "title": candidate.get("title"),
-        "author": ", ".join(candidate.get("authors") or []) or None,
-        "narrator": None,
-        "publisher": None,
-        "publishedYear": None,
-        "publishedDate": None,
-        "description": None,
-        "cover": candidate.get("search_cover"),
-        "isbn": None,
-        "duration": None,
-        "pages": None,
-        "translator": None,
-        "genres": [],
-        "tags": [],
-        "series": None,
-        "sequence": None,
-        "language": "pol",
-        "url": candidate["url"],
-        "type": media_type,
+        "title": candidate.get("title"), "author": ", ".join(candidate.get("authors") or []) or None,
+        "narrator": None, "publisher": None, "publishedYear": None, "publishedDate": None,
+        "description": None, "cover": candidate.get("search_cover"), "isbn": None, "duration": None,
+        "pages": None, "translator": None, "genres": [], "tags": [], "series": None,
+        "sequence": None, "language": "pol", "url": candidate["url"], "type": media_type,
     }
-
     data["title"] = static_field(soup, "h1") or data["title"]
-    data["description"] = (
-        static_field(soup, "#book-description")
-        or static_field(soup, "[id*='description']")
-        or static_field(soup, "[class*='description']")
-        or static_meta(soup, "meta[property='og:description']")
-    )
-    data["cover"] = (
-        static_field(soup, "a#js-lightboxCover", "href")
-        or static_field(soup, ".book-cover__link", "href")
-        or static_meta(soup, "meta[property='og:image']")
-        or data["cover"]
-    )
+    data["description"] = static_field(soup, "#book-description") or static_meta(soup, "meta[property='og:description']")
+    data["cover"] = static_field(soup, "a#js-lightboxCover", "href") or static_field(soup, ".book-cover__link", "href") or static_meta(soup, "meta[property='og:image']") or data["cover"]
     data["cover"] = urljoin(BASE, data["cover"]) if data["cover"] else None
-    data["publisher"] = (
-        static_field(soup, "[data-ga-book-publishers]", "data-ga-book-publishers")
-        or text_after_heading(soup, ["Wydawnictwo", "Wydawca"])
-    )
+    data["publisher"] = static_field(soup, "[data-ga-book-publishers]", "data-ga-book-publishers") or static_field(soup, "dt[title*='Wydawnictwo'] + dd")
     data["isbn"] = static_meta(soup, "meta[property='books:isbn']")
-    data["language"] = text_after_heading(soup, ["Język"]) or "pol"
-    data["publishedDate"] = text_after_heading(soup, ["Data pierwszego wydania", "Data wydania", "Data publikacji", "Data premiery"])
+
+    body_text = soup.get_text("\n", strip=True)
+    lines = lines_from_body(body_text)
+    data["language"] = value_after_label(lines, ["Język", "Języki"]) or "pol"
+    data["publishedDate"] = value_after_label(lines, ["Data pierwszego wydania", "Data wydania", "Data publikacji", "Data premiery"])
     data["publishedYear"] = parse_year(data["publishedDate"])
-    data["translator"] = text_after_heading(soup, ["Tłumacz"])
-    data["pages"] = text_after_heading(soup, ["Liczba stron", "Strony"])
-    data["narrator"] = text_after_heading(soup, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
-    data["duration"] = parse_duration(text_after_heading(soup, ["Długość", "Czas", "Czas trwania", "Czas trwania audiobooka"]))
+    data["translator"] = value_after_label(lines, ["Tłumacz", "Tłumacz:"])
+    data["pages"] = value_after_label(lines, ["Liczba stron", "Strony"])
+    data["narrator"] = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
+    data["duration"] = parse_duration(value_after_label(lines, ["Długość", "Czas czytania", "Czas trwania", "Czas trwania audiobooka", "Czas"]))
+    data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
+    data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
 
     for script in soup.select("script[type='application/ld+json']"):
         for obj in jsonld_objects(script.string or script.get_text()):
@@ -353,26 +340,14 @@ def parse_static_metadata(soup, candidate):
             data["description"] = data["description"] or clean(obj.get("description"))
             data["isbn"] = data["isbn"] or clean(jsonld_value(obj, "isbn", "productID"))
             image = jsonld_value(obj, "image", "thumbnailUrl")
-            if isinstance(image, list):
-                image = image[0] if image else None
-            if isinstance(image, dict):
-                image = image.get("url")
+            if isinstance(image, list): image = image[0] if image else None
+            if isinstance(image, dict): image = image.get("url")
             data["cover"] = data["cover"] or (urljoin(BASE, str(image)) if image else None)
             if media_type == "audiobook":
                 data["narrator"] = data["narrator"] or first_name(jsonld_value(obj, "readBy", "reader", "narrator"))
                 data["duration"] = data["duration"] or parse_duration(jsonld_value(obj, "duration", "timeRequired"))
             break
 
-    body_text = soup.get_text("\n", strip=True)
-    lines = lines_from_body(body_text)
-    data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
-    data["publishedDate"] = data["publishedDate"] or value_after_label(lines, ["Data pierwszego wydania", "Data wydania", "Data publikacji", "Data premiery"])
-    data["publishedYear"] = data["publishedYear"] or parse_year(data["publishedDate"])
-    data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
-    data["narrator"] = data["narrator"] or value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
-    data["duration"] = data["duration"] or parse_duration(value_after_label(lines, ["Długość", "Czas", "Czas czytania", "Czas trwania", "Czas trwania audiobooka"]))
-    data["translator"] = data["translator"] or value_after_label(lines, ["Tłumacz"])
-    data["pages"] = data["pages"] or value_after_label(lines, ["Liczba stron", "Strony"])
     series_value = value_after_label(lines, ["Cykl", "Seria"])
     if series_value:
         m = re.match(r"(.+?)\s*\(tom\s+([0-9IVX]+)\)", series_value, re.I)
@@ -387,27 +362,28 @@ def parse_static_metadata(soup, candidate):
 
 
 async def parse_detail(page, candidate):
-    # One browser request only. urllib was returning HTTP 404 for current LC
-    # audiobook URLs, while the normal browser request succeeds.
-    url = candidate["url"]
-    await open_page(page, url, 120)
+    url = canonical(candidate["url"])
+    try:
+        await open_page(page, url, 300)
+    except Exception as exc:
+        print(f"[Lubimyczytać] detail navigation failed: {type(exc).__name__}: {exc} url={url}")
+        return {
+            "title": candidate.get("title"), "author": ", ".join(candidate.get("authors") or []) or None,
+            "cover": candidate.get("search_cover"), "url": url, "type": candidate.get("type", "book"),
+            "description": None, "isbn": None, "publisher": None, "narrator": None,
+            "duration": None, "publishedYear": None, "series": None, "sequence": None, "language": "pol",
+        }
     html = await page.content()
     soup = BeautifulSoup(html, "html.parser")
-    data = parse_static_metadata(soup, candidate)
+    data = parse_static_metadata(soup, {**candidate, "url": url})
     data["url"] = url
-    # Search-card cover is a reliable fallback when the detail DOM changes.
-    if not data.get("cover"):
-        data["cover"] = candidate.get("search_cover")
     print(f"[Lubimyczytać] detail: type={data['type']} cover={'yes' if data.get('cover') else 'no'} description={len(data.get('description') or '')}chars publisher={data.get('publisher') or '-'} narrator={data.get('narrator') or '-'} duration={data.get('duration') or '-'} year={data.get('publishedYear') or '-'} url={url}")
     return data
 
 
 def score(data, query, author, candidate_authors=None):
     title_s = similarity(data.get("title"), query)
-    values = []
-    if data.get("author"):
-        values.append(data["author"])
-    values.extend(candidate_authors or [])
+    values = ([data["author"]] if data.get("author") else []) + (candidate_authors or [])
     author_s = max((similarity(x, author) for x in values if x), default=0.5) if author else 1.0
     combined = title_s * 0.60 + author_s * 0.40 if author else title_s
     if author and author_s < 0.15:
@@ -419,23 +395,15 @@ def score(data, query, author, candidate_authors=None):
 
 def to_match(data, value):
     description = data.get("description")
-    if description == "Ta książka nie posiada jeszcze opisu.":
-        description = "Brak opisu."
+    if description == "Ta książka nie posiada jeszcze opisu.": description = "Brak opisu."
     return {
-        "title": data.get("title"),
-        "author": data.get("author"),
-        "narrator": data.get("narrator"),
-        "publisher": data.get("publisher"),
-        "publishedYear": data.get("publishedYear"),
-        "description": description,
-        "cover": data.get("cover"),
-        "isbn": data.get("isbn"),
+        "title": data.get("title"), "author": data.get("author"), "narrator": data.get("narrator"),
+        "publisher": data.get("publisher"), "publishedYear": data.get("publishedYear"),
+        "description": description, "cover": data.get("cover"), "isbn": data.get("isbn"),
         "genres": data.get("genres") or None,
         "series": ([{"series": data["series"], "sequence": data.get("sequence")}] if data.get("series") else None),
-        "language": data.get("language", "pol"),
-        "duration": data.get("duration"),
-        "type": data.get("type", "book"),
-        "similarity": round(value, 3),
+        "language": data.get("language", "pol"), "duration": data.get("duration"),
+        "type": data.get("type", "book"), "similarity": round(value, 3),
     }
 
 
@@ -447,14 +415,16 @@ async def lubimyczytac_search(query, author=""):
         return cached[1]
 
     context = await get_context()
-    search = await context.new_page()
+    books_page = await context.new_page()
+    audio_page = await context.new_page()
     try:
         books, audiobooks = await asyncio.gather(
-            search_page(search, query, author, "ksiazki", "book"),
-            search_page(search, query, author, "audiobooki", "audiobook"),
+            search_page(books_page, query, author, "ksiazki", "book"),
+            search_page(audio_page, query, author, "audiobooki", "audiobook"),
         )
     finally:
-        await search.close()
+        await books_page.close()
+        await audio_page.close()
 
     candidates = books + audiobooks
     unique = {}
@@ -468,7 +438,6 @@ async def lubimyczytac_search(query, author=""):
         title_s = similarity(item.get("title"), query)
         author_s = max((similarity(x, author) for x in item.get("authors") or []), default=0.5) if author else 1.0
         item["pre_score"] = title_s * 0.60 + author_s * 0.40 if author else title_s
-
     candidates.sort(key=lambda x: (x["pre_score"], 1 if x["type"] == "audiobook" else 0), reverse=True)
     candidates = candidates[:MAX_DETAIL_CANDIDATES]
     print(f"[Lubimyczytać] candidates to parse: {len(candidates)}")
@@ -488,25 +457,19 @@ async def lubimyczytac_search(query, author=""):
                 await page.close()
 
     parsed = await asyncio.gather(*(parse_one(c) for c in candidates))
-    ranked = []
-    seen = set()
+    ranked, seen = [], set()
     for result in parsed:
-        if not result:
-            continue
+        if not result: continue
         value, data = result
-        if value <= 0:
-            continue
-        dedupe = (data.get("url", "").rstrip("/"), data.get("type"))
-        if dedupe in seen:
-            continue
+        if value <= 0: continue
+        dedupe = (data.get("url"), data.get("type"))
+        if dedupe in seen: continue
         seen.add(dedupe)
         ranked.append((value, data))
         print(f"[Lubimyczytać] parsed: {data.get('title')} / {data.get('author')} type={data.get('type')} score={value:.3f} url={data.get('url')}")
-
     ranked.sort(key=lambda x: (x[0], 1 if x[1].get("type") == "audiobook" else 0), reverse=True)
     final = [to_match(data, value) for value, data in ranked[:MAX_RESULTS]]
     print("[Lubimyczytać] final:", " | ".join(f"{x['title']}/{x.get('author')} [{x['type']}] ({x['similarity']:.3f})" for x in final))
-
     result = {"matches": final}
     _cache[key] = (time.time(), result)
     return result
