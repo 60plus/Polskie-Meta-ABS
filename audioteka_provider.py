@@ -294,6 +294,83 @@ def rank_urls(urls, query):
     return sorted([u for u in unique if not is_blocked_url(u)], key=rank)
 
 
+async def first_selector_text(page, selectors, min_length=1):
+    """Return the first useful visible text matching one of the supplied selectors."""
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count():
+                value = clean(await locator.inner_text())
+                if value and len(value) >= min_length:
+                    return value
+        except Exception:
+            pass
+    return None
+
+
+async def extract_description(page, series_page):
+    # Audioteka uses different dedicated description containers for products
+    # and series. Do not use generic body text: it can pick up reviews, footer,
+    # recommendations, or other unrelated copy.
+    if series_page:
+        selectors = [
+            "[class*='paragraph_description_']",
+            "[class^='paragraph_description_']",
+        ]
+    else:
+        selectors = [
+            ".audiobook-description",
+            "[class*='audiobook-description']",
+        ]
+    return await first_selector_text(page, selectors, min_length=20)
+
+
+async def extract_published_year(page, lines, jsonld_year=None):
+    if jsonld_year:
+        return jsonld_year
+
+    # Prefer explicit metadata attributes/meta tags before looking at rendered labels.
+    meta_selectors = [
+        "meta[itemprop='datePublished']",
+        "meta[property='article:published_time']",
+        "meta[name='datePublished']",
+        "meta[name='release_date']",
+        "meta[name='publish_date']",
+        "time[datetime]",
+        "[itemprop='datePublished']",
+    ]
+    for selector in meta_selectors:
+        try:
+            locator = page.locator(selector).first
+            if await locator.count():
+                value = clean(await locator.get_attribute("content"))
+                if not value:
+                    value = clean(await locator.get_attribute("datetime"))
+                if not value:
+                    value = clean(await locator.inner_text())
+                year = parse_year(value)
+                if year:
+                    return year
+        except Exception:
+            pass
+
+    # Audioteka has used several visible labels over time.
+    value = extract_line_value(
+        lines,
+        [
+            "Data publikacji",
+            "Data wydania",
+            "Data premiery",
+            "Rok publikacji",
+            "Rok wydania",
+            "Rok premiery",
+            "Premiera",
+            "Wydano",
+        ],
+    )
+    return parse_year(value)
+
+
 async def parse_product(page, url, query, author="", enrich_series=False):
     await open_page(page, url, 450)
     body = await page.locator("body").inner_text()
@@ -374,8 +451,11 @@ async def parse_product(page, url, query, author="", enrich_series=False):
     if data["title"] in {"Cały sezon już dostępny!", "Cały sezon już dostępny"}:
         data["title"] = query or extract_title_from_url(url)
 
-    data["description"] = data["description"] or og_description
+    # Use Audioteka's dedicated description blocks first, then JSON-LD/OG fallback.
+    dedicated_description = await extract_description(page, series_page)
+    data["description"] = dedicated_description or data["description"] or og_description
     data["cover"] = data["cover"] or og_image
+    data["publishedYear"] = await extract_published_year(page, lines, data["publishedYear"])
     data["author"] = data["author"] or extract_line_value(lines, ["Autor", "Autorzy", "Scenariusz"])
     data["publisher"] = data["publisher"] or extract_line_value(lines, ["Wydawca"])
     data["narrator"] = data["narrator"] or extract_names_after_label(lines, ["Głosy", "Lektor", "Czyta"], ["Długość", "Wydawca", "Typ", "Format", "Język", "Kategoria", "Opis"])
