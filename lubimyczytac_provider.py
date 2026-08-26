@@ -120,6 +120,12 @@ def value_after_label(lines, labels):
     return None
 
 
+# Backwards-compatible name used by lubimyczytac_patch.py.
+# Keep one implementation so the provider and patch cannot drift apart.
+def label_value(lines, labels):
+    return value_after_label(lines, labels)
+
+
 def series_from_lines(lines):
     for i, line in enumerate(lines):
         if norm(line) in {"cykl", "seria"} and i + 1 < len(lines):
@@ -211,8 +217,6 @@ async def parse_detail(page, candidate):
         "type": item_type,
     }
 
-    # Page H1 is authoritative. This also prevents recommendation JSON-LD from
-    # replacing the product title.
     h1 = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
     if h1:
         data["title"] = h1
@@ -221,7 +225,6 @@ async def parse_detail(page, candidate):
     for raw in await page.locator("script[type='application/ld+json']").all_text_contents():
         objects.extend(jsonld_objects(raw))
 
-    # Only consider JSON-LD objects whose name matches the current product.
     target = None
     best = -1.0
     current_title = data.get("title") or candidate.get("title") or url_title(url)
@@ -267,7 +270,6 @@ async def parse_detail(page, candidate):
     except Exception:
         pass
 
-    # The product page is authoritative for its own cover.
     for selector in (
         "a#js-lightboxCover[href]",
         ".book-cover__link[href]",
@@ -289,8 +291,6 @@ async def parse_detail(page, candidate):
         except Exception:
             pass
 
-    # Keep the search-card author unless the detail page explicitly provides a
-    # better author value. This protects the known audiobook result.
     detail_authors = []
     for selector in ("a.book__author", ".book__authors a[href*='/autor/']"):
         try:
@@ -300,14 +300,14 @@ async def parse_detail(page, candidate):
     if detail_authors:
         data["author"] = ", ".join(dict.fromkeys(detail_authors[:5]))
 
-    data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
-    data["publishedYear"] = data["publishedYear"] or parse_year(value_after_label(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
-    data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
-    data["duration"] = data["duration"] or parse_duration(value_after_label(lines, ["Czas czytania", "Długość", "Czas trwania"]))
-    data["narrator"] = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"]) or data["narrator"]
-    language = value_after_label(lines, ["Język"])
+    data["publisher"] = data["publisher"] or label_value(lines, ["Wydawca", "Wydawnictwo"])
+    data["publishedYear"] = data["publishedYear"] or parse_year(label_value(lines, ["Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"]))
+    data["isbn"] = data["isbn"] or label_value(lines, ["ISBN"])
+    data["duration"] = data["duration"] or parse_duration(label_value(lines, ["Czas czytania", "Długość", "Czas trwania"]))
+    data["narrator"] = label_value(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"]) or data["narrator"]
+    language = label_value(lines, ["Język"])
     data["language"] = "pol" if not language or norm(language) in {"polski", "polska", "pol"} else norm(language)
-    category = value_after_label(lines, ["Kategoria", "Kategorie"])
+    category = label_value(lines, ["Kategoria", "Kategorie"])
     if category:
         data["genres"] = [clean(x) for x in re.split(r"[,;/]", category) if clean(x)]
     data["series"], data["sequence"] = series_from_lines(lines)
@@ -438,7 +438,5 @@ async def shutdown():
         await _context.close()
     if _browser:
         await _browser.close()
-    if _pw:
-        await _browser.close() if _browser else None
     if _pw:
         await _pw.stop()
