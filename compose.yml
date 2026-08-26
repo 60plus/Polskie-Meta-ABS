@@ -1,7 +1,8 @@
 services:
-  storytel-pl-adb:
+  polskie-meta-abs:
     build: .
-    container_name: storytel-pl-adb
+    container_name: polskie-meta-abs
     restart: unless-stopped
     ports:
       - "3000:3000"
+      - "3001:3001"
