@@ -1,4 +1,5 @@
 import asyncio
+import html as html_lib
 import json
 import re
 import time
@@ -26,7 +27,6 @@ HEADERS = {
     "User-Agent": "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
     "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,*/*;q=0.8",
     "Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7",
-    "Cache-Control": "no-cache",
 }
 
 
@@ -86,23 +86,24 @@ def jsonld_objects(soup):
             continue
         values = data if isinstance(data, list) else [data]
         for item in values:
-            if not isinstance(item, dict):
-                continue
-            result.append(item)
-            if isinstance(item.get("@graph"), list):
-                result.extend(x for x in item["@graph"] if isinstance(x, dict))
+            if isinstance(item, dict):
+                result.append(item)
+                if isinstance(item.get("@graph"), list):
+                    result.extend(x for x in item["@graph"] if isinstance(x, dict))
     return result
 
 
 def person_names(value):
     if isinstance(value, dict):
-        return [clean(value.get("name"))] if clean(value.get("name")) else []
+        name = clean(value.get("name"))
+        return [name] if name else []
     if isinstance(value, list):
         out = []
         for item in value:
             out.extend(person_names(item))
         return list(dict.fromkeys(x for x in out if x))
-    return [clean(value)] if clean(value) else []
+    value = clean(value)
+    return [value] if value else []
 
 
 def first_person(value):
@@ -133,7 +134,7 @@ async def get_http():
                 headers=HEADERS,
                 follow_redirects=True,
                 timeout=httpx.Timeout(20.0, connect=10.0),
-                limits=httpx.Limits(max_connections=12, max_keepalive_connections=6),
+                limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
             )
         return _http
 
@@ -144,98 +145,132 @@ async def fetch_html(url):
         try:
             response = await client.get(url, headers={"Referer": f"{PL}/"})
             if response.status_code == 429:
-                await asyncio.sleep(1.5 * attempt)
+                await asyncio.sleep(1.0 * attempt)
                 continue
             response.raise_for_status()
             return response.text
         except Exception as exc:
             if attempt == 3:
                 print(f"[BookBeat] HTTP failed: {url} {type(exc).__name__}: {exc}")
-            await asyncio.sleep(0.4 * attempt)
+            await asyncio.sleep(0.35 * attempt)
     return None
 
 
-async def search_page(query, author=None, series=False):
-    params = {"q": query}
-    if series:
-        params["series"] = query
-    else:
-        params["title"] = query
-    url = f"{SEARCH}?q={quote(query)}"
-    if series:
-        url += f"&series={quote(query)}"
-    else:
-        url += f"&title={quote(query)}"
-    print(f"[BookBeat] search: {url}")
-    html = await fetch_html(url)
-    if not html:
+def extract_book_urls(raw):
+    """BookBeat search results are often embedded in escaped application JSON.
+    Do not depend on visible <a> elements being present in the initial HTML.
+    """
+    if not raw:
         return []
 
-    soup = BeautifulSoup(html, "html.parser")
+    text = html_lib.unescape(raw)
+    for _ in range(2):
+        text = text.replace(r"\/", "/").replace(r"\u002F", "/")
+        text = text.replace(r"\u0026", "&").replace(r"\u003A", ":")
+        text = html_lib.unescape(text)
+
+    patterns = [
+        r"https?://(?:www\.)?bookbeat\.com/pl/book/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+",
+        r"(?<![A-Za-z0-9])(/pl/book/[A-Za-z0-9._~:/?#\[\]@!$&'()*+,;=%-]+)",
+    ]
+    found = []
+    seen = set()
+    for pattern in patterns:
+        for match in re.finditer(pattern, text):
+            value = match.group(0).rstrip("\\\"'<>),.;]")
+            if value.startswith("/"):
+                value = urljoin(BASE, value)
+            value = canonical(value)
+            if is_book_url(value) and value not in seen:
+                seen.add(value)
+                found.append(value)
+    return found
+
+
+def candidate_from_link(url, soup):
+    link = soup.find("a", href=lambda x: x and "/pl/book/" in x)
+    if not link:
+        return {"url": url, "title": url_title(url), "authors": [], "cover": None}
+    return {
+        "url": url,
+        "title": clean(link.get_text(" ", strip=True)) or url_title(url),
+        "authors": [],
+        "cover": None,
+    }
+
+
+async def search_page(query, author=None, series=False):
+    url = f"{SEARCH}?q={quote(query)}"
+    url += f"&{'series' if series else 'title'}={quote(query)}"
+    print(f"[BookBeat] search: {url}")
+    raw = await fetch_html(url)
+    if not raw:
+        return []
+
+    soup = BeautifulSoup(raw, "html.parser")
     found, seen = [], set()
 
+    # First use normal anchors when BookBeat renders them server-side.
+    urls = []
     for link in soup.select("a[href*='/pl/book/']"):
-        href = link.get("href")
-        if not href:
-            continue
-        href = canonical(urljoin(BASE, href))
+        href = clean(link.get("href"))
+        if href:
+            urls.append(canonical(urljoin(BASE, href)))
+
+    # Then inspect the application state / escaped JSON. This is the important
+    # fallback: BookBeat can return zero visible anchors while the book cards
+    # are already present in the HTML as serialized application data.
+    urls.extend(extract_book_urls(raw))
+
+    for href in urls:
         if not is_book_url(href) or href in seen:
             continue
         seen.add(href)
 
-        card = link
-        for _ in range(5):
-            parent = card.parent
-            if not parent:
-                break
-            text = clean(parent.get_text(" ", strip=True)) or ""
-            if len(text) > 30:
-                card = parent
-                break
-            card = parent
-
-        title = None
-        for selector in ["h2", "h3", "h4", "[data-testid*='title']"]:
-            node = card.select_one(selector)
-            if node and clean(node.get_text(" ", strip=True)):
-                title = clean(node.get_text(" ", strip=True))
-                break
-        title = title or clean(link.get_text(" ", strip=True)) or url_title(href)
-
+        title = url_title(href)
         authors = []
-        for selector in ["a[href*='/authors/']", "a[href*='/author/']"]:
-            authors.extend(clean(x.get_text(" ", strip=True)) for x in card.select(selector))
-        authors = list(dict.fromkeys(x for x in authors if x))
-
         cover = None
-        img = card.select_one("img")
-        if img:
-            for attr in ("src", "data-src", "data-lazy-src", "srcset"):
-                value = clean(img.get(attr))
-                if not value:
-                    continue
-                if attr == "srcset":
-                    value = value.split(",")[0].strip().split()[0]
-                if not value.startswith("data:"):
-                    cover = urljoin(BASE, value)
+        link = soup.find("a", href=lambda x, h=href: x and canonical(urljoin(BASE, x)) == h)
+        if link:
+            title = clean(link.get_text(" ", strip=True)) or title
+            card = link
+            for _ in range(6):
+                parent = card.parent
+                if not parent:
                     break
+                text = clean(parent.get_text(" ", strip=True)) or ""
+                if len(text) > 30:
+                    card = parent
+                    break
+                card = parent
+            for selector in ["h2", "h3", "h4", "[data-testid*='title']"]:
+                node = card.select_one(selector)
+                if node and clean(node.get_text(" ", strip=True)):
+                    title = clean(node.get_text(" ", strip=True))
+                    break
+            for selector in ["a[href*='/authors/']", "a[href*='/author/']"]:
+                authors.extend(clean(x.get_text(" ", strip=True)) for x in card.select(selector))
+            img = card.select_one("img")
+            if img:
+                for attr in ("src", "data-src", "data-lazy-src", "srcset"):
+                    value = clean(img.get(attr))
+                    if not value:
+                        continue
+                    if attr == "srcset":
+                        value = value.split(",")[0].strip().split()[0]
+                    if not value.startswith("data:"):
+                        cover = urljoin(BASE, value)
+                        break
 
-        found.append({"url": href, "title": title, "authors": authors, "cover": cover})
+        found.append({
+            "url": href,
+            "title": title,
+            "authors": list(dict.fromkeys(x for x in authors if x)),
+            "cover": cover,
+        })
 
     print(f"[BookBeat] search '{query}' -> {len(found)} book URLs")
     return found
-
-
-def label_value(lines, labels):
-    wanted = {norm(x).rstrip(":") for x in labels}
-    for i, line in enumerate(lines):
-        if norm(line).rstrip(":") != wanted:
-            continue
-        for candidate in lines[i + 1:i + 5]:
-            candidate = clean(candidate)
-            if candidate and norm(candidate).rstrip(":") not in wanted:
-                return candidate
-    return None
 
 
 def find_label_text(text, labels):
@@ -256,20 +291,18 @@ def series_info(text):
     ]
     for pattern in patterns:
         match = re.search(pattern, text, re.I)
-        if not match:
-            continue
-        groups = match.groups()
-        if groups[0].isdigit():
-            return clean(groups[1]), groups[0]
-        return clean(groups[0]), groups[1]
+        if match:
+            groups = match.groups()
+            if groups[0].isdigit():
+                return clean(groups[1]), groups[0]
+            return clean(groups[0]), groups[1]
     return None, None
 
 
-def parse_detail(html, candidate):
-    soup = BeautifulSoup(html, "html.parser")
+def parse_detail(raw, candidate):
+    soup = BeautifulSoup(raw, "html.parser")
     body = soup.get_text("\n", strip=True)
     flat = clean(body) or ""
-    lines = [clean(x) for x in body.splitlines() if clean(x)]
 
     data = {
         "title": candidate.get("title"),
@@ -310,7 +343,8 @@ def parse_detail(html, candidate):
             image = image[0] if image else None
         if isinstance(image, dict):
             image = image.get("url")
-        data["cover"] = data["cover"] or (urljoin(BASE, str(image)) if image else None)
+        if image:
+            data["cover"] = data["cover"] or urljoin(BASE, str(image))
         genre = item.get("genre")
         if isinstance(genre, list):
             data["genres"].extend(clean(x) for x in genre if clean(x))
@@ -321,11 +355,7 @@ def parse_detail(html, candidate):
     if h1:
         data["title"] = clean(h1.get_text(" ", strip=True)) or data["title"]
 
-    for selector in [
-        "meta[property='og:description']",
-        "meta[name='description']",
-        "[data-testid*='description']",
-    ]:
+    for selector in ["meta[property='og:description']", "meta[name='description']", "[data-testid*='description']"]:
         node = soup.select_one(selector)
         if node:
             value = node.get("content") if node.name == "meta" else node.get_text(" ", strip=True)
@@ -348,10 +378,6 @@ def parse_detail(html, candidate):
     data["publishedYear"] = data["publishedYear"] or parse_year(find_label_text(flat, ["Data wydania", "Data publikacji", "Data premiery"]))
     data["duration"] = data["duration"] or parse_duration(find_label_text(flat, ["Czas trwania", "Długość", "Czas"])) or parse_duration(flat)
 
-    if not data["isbn"]:
-        match = re.search(r"\b(97[89]\d{10})\b", flat)
-        data["isbn"] = match.group(1) if match else None
-
     language = find_label_text(flat, ["Język", "Języki"])
     if language and norm(language) in {"polski", "polish", "pl"}:
         data["language"] = "pol"
@@ -360,7 +386,6 @@ def parse_detail(html, candidate):
     data["series"] = series
     data["sequence"] = sequence
     data["genres"] = list(dict.fromkeys(x for x in data["genres"] if x))
-
     return data
 
 
@@ -391,23 +416,20 @@ async def bookbeat_search(query, author=""):
         print(f"[BookBeat] cache hit: {key}")
         return cached[1]
 
-    # BookBeat exposes title and series search separately. Query both so a
-    # title that is mainly surfaced through a series still gets found.
     pages = await asyncio.gather(
         search_page(query, author, series=False),
         search_page(query, author, series=True),
     )
-    candidates = []
-    seen = set()
+
+    candidates, seen = [], set()
     for group in pages:
         for item in group:
             if item["url"] not in seen:
                 seen.add(item["url"])
                 candidates.append(item)
 
-    if author:
-        author_query = f"{query} {author}"
-        extra = await search_page(author_query, author, series=False)
+    if author and not candidates:
+        extra = await search_page(f"{query} {author}", author, series=False)
         for item in extra:
             if item["url"] not in seen:
                 seen.add(item["url"])
@@ -415,7 +437,7 @@ async def bookbeat_search(query, author=""):
 
     def candidate_rank(item):
         title_score = similarity(item.get("title"), query)
-        author_score = similarity(item.get("authors", [""])[0] if item.get("authors") else "", author) if author else 1.0
+        author_score = similarity((item.get("authors") or [""])[0], author) if author else 1.0
         return title_score * 0.75 + author_score * 0.25 if author else title_score
 
     candidates.sort(key=candidate_rank, reverse=True)
@@ -423,14 +445,14 @@ async def bookbeat_search(query, author=""):
     print(f"[BookBeat] candidates to parse: {len(candidates)}")
 
     async def enrich(item):
-        html = await fetch_html(item["url"])
-        if not html:
+        raw = await fetch_html(item["url"])
+        if not raw:
             return None
         try:
-            data = parse_detail(html, item)
-            ts = similarity(data.get("title"), query)
-            aa = similarity(data.get("author"), author) if author else 1.0
-            score = ts * 0.75 + aa * 0.25 if author else ts
+            data = parse_detail(raw, item)
+            title_score = similarity(data.get("title"), query)
+            author_score = similarity(data.get("author"), author) if author else 1.0
+            score = title_score * 0.75 + author_score * 0.25 if author else title_score
             if data.get("language") == "pol":
                 score = min(1.0, score + 0.02)
             print(f"[BookBeat] detail: {data.get('title')} / {data.get('author')} score={score:.3f} url={data.get('url')}")
@@ -440,8 +462,8 @@ async def bookbeat_search(query, author=""):
             return None
 
     enriched = []
-    for i in range(0, len(candidates), 6):
-        batch = await asyncio.gather(*(enrich(x) for x in candidates[i:i + 6]))
+    for i in range(0, len(candidates), 8):
+        batch = await asyncio.gather(*(enrich(x) for x in candidates[i:i + 8]))
         enriched.extend(x for x in batch if x)
 
     enriched.sort(key=lambda x: x[0], reverse=True)
