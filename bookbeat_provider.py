@@ -204,30 +204,50 @@ async def browser_search_page(query):
 
 
 async def browser_detail_page(url):
-    """Fetch the fully rendered detail DOM, including lazy-loaded metadata."""
+    """Fetch the fully rendered detail DOM, expanding BookBeat's hidden metadata."""
     async with _browser_lock:
         try:
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # BookBeat renders the secondary metadata lazily. Scroll through the
-            # page so publisher/ISBN/publication date/category rows are mounted.
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(1200)
-            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(800)
+            # The secondary metadata is behind an explicit "Pokaż więcej" button.
+            # Scrolling alone does not mount these rows, so click the button first.
+            show_more = page.get_by_role("button", name=re.compile(r"Pokaż więcej", re.I))
+            if await show_more.count():
+                try:
+                    await show_more.first.scroll_into_view_if_needed(timeout=3000)
+                    await show_more.first.click(timeout=5000)
+                    await page.wait_for_timeout(500)
+                except Exception as exc:
+                    print(f"[BookBeat] browser detail: Pokaż więcej click failed: {type(exc).__name__}: {exc}")
 
+            # Some pages load additional rows only after the expanded section is
+            # brought into view. Scroll after the click and give React time to mount it.
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(900)
+
+            metadata_selector = (
+                "[aria-label='Oryginalny rok publikacji'], "
+                "[aria-label='Data publikacji audiobooka'], "
+                "[aria-label='Wydawca audiobooka'], "
+                "[aria-label='Wydawca e-booka'], "
+                "[aria-label='Numer ISBN audiobooka'], "
+                "[aria-label='Numer ISBN e-book']"
+            )
             try:
-                await page.locator(
-                    "[aria-label='Oryginalny rok publikacji'], "
-                    "[aria-label='Data publikacji audiobooka'], "
-                    "[aria-label='Wydawca audiobooka'], "
-                    "[aria-label='Numer ISBN audiobooka'], "
-                    "[aria-label='Wydawca e-booka'], "
-                    "[aria-label='Numer ISBN e-book']"
-                ).first.wait_for(timeout=5000)
+                await page.locator(metadata_selector).first.wait_for(timeout=5000)
             except Exception:
                 pass
+
+            # A second click handles pages where the first button was replaced by
+            # another collapsed metadata section after the initial render.
+            show_more_again = page.get_by_role("button", name=re.compile(r"Pokaż więcej", re.I))
+            if await show_more_again.count():
+                try:
+                    await show_more_again.first.click(timeout=3000)
+                    await page.wait_for_timeout(500)
+                except Exception:
+                    pass
 
             return await page.content()
         except Exception as exc:
@@ -503,6 +523,7 @@ def parse_detail(html, candidate):
     data["duration"] = duration
     data["genres"] = genres_from_bookbeat(soup) or list(dict.fromkeys(x for x in data["genres"] if x))
     data["series"], data["sequence"] = series_from_bookbeat(soup, flat)
+
     return data
 
 
