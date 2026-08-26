@@ -131,27 +131,25 @@ Dane są pobierane ze strony właściwego produktu, dzięki czemu wynik może za
 
 ## BookBeat Polska
 
-Provider BookBeat wyszukuje polskie pozycje z katalogu BookBeat i pobiera dane ze stron konkretnych książek.
+Provider BookBeat obsługuje polski katalog BookBeat i wyszukuje audiobooki po tytule oraz autorze. Wyniki są następnie sprawdzane na stronie konkretnego produktu.
 
 Obsługiwane są między innymi:
 
-- wyszukiwanie po tytule;
-- wyszukiwanie po serii;
-- autor;
+- tytuł i autor;
 - lektor;
 - opis;
 - okładka;
 - wydawca;
-- rok wydania;
-- ISBN;
+- rok publikacji;
+- ISBN audiobooka;
 - język;
 - gatunek;
 - seria i numer tomu;
-- czas trwania.
+- czas trwania audiobooka.
 
-BookBeat może udostępniać ten sam tytuł jako audiobook i e-book. Provider zwraca wynik jako audiobook, gdy jest używany jako źródło metadanych dla biblioteki audiobooków.
+BookBeat może udostępniać ten sam tytuł jako audiobook i e-book. Provider dla Audiobookshelf korzysta z danych wydania audiobookowego, jeśli są dostępne, dzięki czemu np. czas trwania, ISBN i wydawca dotyczą właściwego wydania.
 
-Dla przykładu BookBeat posiada stronę produktu `Operacja Mir`, a wyszukiwanie serii może znaleźć również pozycje należące do danego cyklu. Dane takie jak opis, autor, lektor i czas trwania są pobierane ze strony produktu, a nie tylko z listy wyszukiwania.
+Opis oraz szczegółowe informacje są pobierane ze strony produktu, a nie z samej listy wyszukiwania. Dzięki temu wynik może zawierać również pełniejsze informacje o obsadzie, lektorze, serii i wydaniu.
 
 ## Dopasowanie
 
@@ -205,7 +203,7 @@ Provider Lubimyczytać Polska — wyszukiwanie książek i audiobooków oraz pob
 
 ### `bookbeat_provider.py`
 
-Provider BookBeat Polska — wyszukiwanie książek, wyszukiwanie po serii oraz pobieranie metadanych stron produktów.
+Provider BookBeat Polska — wyszukiwanie oraz pobieranie metadanych audiobooków ze stron produktów.
 
 ### `nginx.conf`
 
