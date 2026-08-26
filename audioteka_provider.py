@@ -117,6 +117,10 @@ async def browser_context():
 
 async def goto(page, url, wait=900):
     await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+    try:
+        await page.wait_for_load_state("networkidle", timeout=7000)
+    except Exception:
+        pass
     await page.wait_for_timeout(wait)
     for selector in ("button:has-text('Akceptuję')", "button:has-text('Zgadzam się')", "button:has-text('Zaakceptuj')"):
         try:
@@ -148,7 +152,10 @@ async def collect_links(page):
 async def search_urls(page, query):
     url = f"{SEARCH}?phrase={quote(query)}"
     print(f"[Audioteka] search: {url}")
-    await goto(page, url, 1200)
+    await goto(page, url, 1400)
+    for _ in range(5):
+        await page.mouse.wheel(0, 1600)
+        await page.wait_for_timeout(300)
     urls = await collect_links(page)
     print(f"[Audioteka] search '{query}' -> {len(urls)} product/series URLs")
     return urls
@@ -165,7 +172,7 @@ async def direct_candidates(page, query):
     found = []
     for url in candidates:
         try:
-            await goto(page, url, 400)
+            await goto(page, url, 500)
             final = canonical(page.url)
             title = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
             if page.url.startswith(BASE) and title and "404" not in (await page.title()).lower() and "nie znaleziono" not in title.lower():
@@ -236,25 +243,12 @@ async def parse_page(page, url, series_hint=False, collect_page_links=False):
     publisher = publisher or extract_label(text, ["Wydawca"])
     voice = extract_label(text, ["Głosy", "Lektor", "Czyta"])
     narrators = unique_names(voice)
-    isbn = isbn or (re.search(r"\b(97[89]\d{10})\b", text) or [None, None])[1]
+    isbn_match = re.search(r"\b(97[89]\d{10})\b", text)
+    isbn = isbn or (isbn_match.group(1) if isbn_match else None)
     published = published or year(text)
     duration = duration or duration_minutes(text)
 
     links = await collect_links(page) if collect_page_links else []
-    # A series page often does not expose the author in JSON-LD. Its episode links do.
-    if series_hint and not author:
-        for link in [u for u in links if is_product(u)][:3]:
-            try:
-                await page.goto(link, wait_until="domcontentloaded", timeout=20000)
-                await page.wait_for_timeout(350)
-                episode_text = re.sub(r"\s+", " ", clean(await page.locator("body").inner_text()) or "")
-                ep_author = extract_label(episode_text, ["Autor", "Autorzy", "Scenariusz"])
-                if ep_author:
-                    author = ep_author
-                    break
-            except Exception:
-                pass
-
     return {
         "title": title,
         "author": author,
@@ -273,37 +267,46 @@ async def parse_page(page, url, series_hint=False, collect_page_links=False):
     }
 
 
+async def enrich_series(ctx, data):
+    episode_urls = [u for u in data.get("links", []) if is_product(u)]
+    if not episode_urls:
+        return data
+    page = await ctx.new_page()
+    try:
+        episode = await parse_page(page, episode_urls[0], collect_page_links=False)
+        for key in ("author", "publisher", "publishedYear", "description", "cover", "isbn"):
+            if not data.get(key) and episode.get(key):
+                data[key] = episode[key]
+        data["narrators"] = list(dict.fromkeys(data.get("narrators", []) + episode.get("narrators", [])))
+        return data
+    finally:
+        await page.close()
+
+
 async def parse_candidate(ctx, url):
     page = await ctx.new_page()
     try:
         if is_series(url):
             data = await parse_page(page, url, series_hint=True, collect_page_links=True)
-            # For an audioserial, use the collection page as the match. The first
-            # episode is enough to recover author/voice data; do not crawl all episodes.
-            episode_urls = [u for u in data["links"] if is_product(u)]
-            if episode_urls:
-                try:
-                    episode = await parse_page(page, episode_urls[0], collect_page_links=False)
-                    data["author"] = data.get("author") or episode.get("author")
-                    data["narrators"] = list(dict.fromkeys(data.get("narrators", []) + episode.get("narrators", [])))
-                    data["publisher"] = data.get("publisher") or episode.get("publisher")
-                    data["cover"] = data.get("cover") or episode.get("cover")
-                except Exception as exc:
-                    print(f"[Audioteka] first episode failed {episode_urls[0]}: {exc}")
-            return data
-        return await parse_page(page, url, collect_page_links=False)
+        else:
+            data = await parse_page(page, url, collect_page_links=False)
     finally:
         await page.close()
+    if is_series(url):
+        data = await enrich_series(ctx, data)
+    return data
 
 
 def score_book(book, query, author):
-    title = book.get("title") or ""
-    # Audioteka uses titles such as "Mazurski Przekręt 2. Audioserial".
-    title_score = sim(title, query)
+    title_score = sim(book.get("title"), query)
     author_score = sim(book.get("author"), author) if author else 1.0
     if author and not book.get("author"):
-        author_score = 0.65
-    return title_score * 0.78 + author_score * 0.22 if author else title_score
+        author_score = 0.60
+    score = title_score * 0.78 + author_score * 0.22 if author else title_score
+    # Exact audioserial slug/title match gets priority over generic results.
+    if book.get("series") and title_score >= 0.90:
+        score += 0.03
+    return min(score, 1.0)
 
 
 async def audioteka_search(query, author=""):
@@ -315,25 +318,31 @@ async def audioteka_search(query, author=""):
     ctx = await browser_context()
     page = await ctx.new_page()
     try:
+        # For short/common queries (e.g. "Siostry"), search first and then
+        # explicitly try the audioserial slug. This catches /cykl/*-audioserial/
+        # even when the search UI does not expose the series card.
         urls = await search_urls(page, query)
         direct = await direct_candidates(page, query)
         urls = list(dict.fromkeys(direct + urls))
-        if author and len(urls) < 2:
-            urls += await search_urls(page, f"{query} {author}")
+        if author:
+            author_urls = await search_urls(page, f"{query} {author}")
+            urls = list(dict.fromkeys(urls + author_urls))
     finally:
         await page.close()
 
-    # Exact/direct candidates first. Limit crawling aggressively: Audioteka search
-    # pages can contain dozens of unrelated links and each detail page is dynamic.
     query_n = norm(query)
-    urls.sort(key=lambda u: (0 if query_n.replace(" ", "-") in norm(urlparse(u).path) else 1, 0 if is_product(u) else 1))
-    urls = list(dict.fromkeys(urls))[:8]
+    def priority(u):
+        path_n = norm(urlparse(u).path)
+        exact_slug = query_n and query_n.replace(" ", "-") in path_n
+        return (0 if exact_slug else 1, 0 if is_series(u) else 1)
+    urls = sorted(urls, key=priority)
+    urls = list(dict.fromkeys(urls))[:12]
 
     print(f"[Audioteka] candidates to parse: {len(urls)}")
     books = []
     for url in urls:
         try:
-            book = await asyncio.wait_for(parse_candidate(ctx, url), timeout=25)
+            book = await asyncio.wait_for(parse_candidate(ctx, url), timeout=30)
             if book.get("title"):
                 books.append(book)
                 print(f"[Audioteka] parsed: {book.get('title')} / {book.get('author')} ({url})")
@@ -342,14 +351,13 @@ async def audioteka_search(query, author=""):
 
     ranked = []
     for book in books:
-        score = score_book(book, query, author)
         title_score = sim(book.get("title"), query)
         author_score = sim(book.get("author"), author) if author else 1.0
         if title_score < 0.45:
             continue
         if author and book.get("author") and author_score < 0.40:
             continue
-        book["similarity"] = round(min(score, 1.0), 4)
+        book["similarity"] = round(score_book(book, query, author), 4)
         ranked.append(book)
 
     ranked.sort(key=lambda x: x["similarity"], reverse=True)
@@ -379,11 +387,7 @@ async def audioteka_search(query, author=""):
 
 
 @app.get("/search")
-async def search(
-    query: str = Query(..., min_length=1),
-    author: str = Query(""),
-    authorization: str | None = Header(default=None),
-):
+async def search(query: str = Query(..., min_length=1), author: str = Query(""), authorization: str | None = Header(default=None)):
     if not authorization:
         raise HTTPException(status_code=401, detail="Unauthorized")
     return JSONResponse(await audioteka_search(query, author))
