@@ -185,12 +185,49 @@ async def get_browser_page():
     return _browser_page
 
 
+async def dismiss_consent(page):
+    """Dismiss OneTrust without requiring a real pointer click on the page."""
+    try:
+        sdk = page.locator("#onetrust-consent-sdk")
+        if not await sdk.count():
+            return
+        selectors = [
+            "#onetrust-accept-btn-handler",
+            "button:has-text('Zezwól na wszystkie')",
+            "button:has-text('Akceptuj wszystkie')",
+            "button:has-text('Zgadzam się')",
+            "button:has-text('Accept All')",
+        ]
+        for selector in selectors:
+            button = page.locator(selector).first
+            if await button.count():
+                try:
+                    await button.click(force=True, timeout=2000)
+                    await page.wait_for_timeout(250)
+                    return
+                except Exception:
+                    continue
+        await page.evaluate("""
+            () => {
+                const root = document.querySelector('#onetrust-consent-sdk');
+                if (!root) return;
+                const buttons = [...root.querySelectorAll('button, a')];
+                const button = buttons.find(b => /zezwól na wszystkie|akceptuj wszystkie|zgadzam się|accept all/i.test((b.innerText || '').trim()));
+                if (button) button.click();
+            }
+        """)
+        await page.wait_for_timeout(250)
+    except Exception:
+        pass
+
+
 async def browser_search_page(query):
     url = f"{SEARCH}?q={quote_plus(query)}&title={quote_plus(query)}"
     async with _browser_lock:
         try:
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await dismiss_consent(page)
             try:
                 await page.locator("a[data-testid='book-card']").first.wait_for(timeout=7000)
             except Exception:
@@ -204,27 +241,28 @@ async def browser_search_page(query):
 
 
 async def browser_detail_page(url):
-    """Fetch the fully rendered detail DOM, expanding BookBeat's hidden metadata."""
+    """Fetch fully rendered detail DOM, expanding hidden BookBeat metadata."""
     async with _browser_lock:
         try:
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+            await dismiss_consent(page)
 
-            # The secondary metadata is behind an explicit "Pokaż więcej" button.
-            # Scrolling alone does not mount these rows, so click the button first.
-            show_more = page.get_by_role("button", name=re.compile(r"Pokaż więcej", re.I))
+            show_more = page.get_by_role("button", name=re.compile(r"Pokaż więcej", re.I)).first
             if await show_more.count():
                 try:
-                    await show_more.first.scroll_into_view_if_needed(timeout=3000)
-                    await show_more.first.click(timeout=5000)
-                    await page.wait_for_timeout(500)
+                    await show_more.scroll_into_view_if_needed(timeout=3000)
+                except Exception:
+                    pass
+                try:
+                    # JS click bypasses OneTrust overlays that can intercept pointer events.
+                    await show_more.evaluate("el => el.click()")
+                    await page.wait_for_timeout(700)
                 except Exception as exc:
-                    print(f"[BookBeat] browser detail: Pokaż więcej click failed: {type(exc).__name__}: {exc}")
+                    print(f"[BookBeat] browser detail: Pokaż więcej JS click failed: {type(exc).__name__}: {exc}")
 
-            # Some pages load additional rows only after the expanded section is
-            # brought into view. Scroll after the click and give React time to mount it.
             await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
-            await page.wait_for_timeout(900)
+            await page.wait_for_timeout(700)
 
             metadata_selector = (
                 "[aria-label='Oryginalny rok publikacji'], "
@@ -235,20 +273,12 @@ async def browser_detail_page(url):
                 "[aria-label='Numer ISBN e-book']"
             )
             try:
-                await page.locator(metadata_selector).first.wait_for(timeout=5000)
+                await page.locator(metadata_selector).first.wait_for(timeout=4000)
             except Exception:
                 pass
 
-            # A second click handles pages where the first button was replaced by
-            # another collapsed metadata section after the initial render.
-            show_more_again = page.get_by_role("button", name=re.compile(r"Pokaż więcej", re.I))
-            if await show_more_again.count():
-                try:
-                    await show_more_again.first.click(timeout=3000)
-                    await page.wait_for_timeout(500)
-                except Exception:
-                    pass
-
+            # Do not click "Pokaż więcej" a second time. The previous implementation
+            # could collapse the section again, which caused the ABS two-request regression.
             return await page.content()
         except Exception as exc:
             print(f"[BookBeat] browser detail failed: {url} {type(exc).__name__}: {exc}")
@@ -372,14 +402,12 @@ def labeled_metadata(soup):
             if value:
                 result[label] = value
                 break
-
     if not result.get("Wydawca audiobooka") and not result.get("Wydawca e-booka"):
         for node in soup.find_all(attrs={"aria-label": re.compile(r"^Wydawca(?: audiobooka| e-booka)?$", re.I)}):
             value = _value_after_label(node)
             if value:
                 result["Wydawca"] = value
                 break
-
     if not result.get("Numer ISBN audiobooka") and not result.get("Numer ISBN e-book"):
         for node in soup.find_all(attrs={"aria-label": re.compile(r"^Numer ISBN(?: audiobooka| e-book)?$", re.I)}):
             value = _value_after_label(node)
@@ -438,7 +466,6 @@ def parse_detail(html, candidate):
     flat = soup.get_text("\n", strip=True) or ""
     meta = labeled_metadata(soup)
     description = description_from_bookbeat(soup)
-
     data = {
         "title": candidate.get("title"),
         "author": ", ".join(candidate.get("authors") or []) or None,
@@ -456,7 +483,6 @@ def parse_detail(html, candidate):
         "type": "audiobook",
         "url": candidate["url"],
     }
-
     for item in jsonld_objects(soup):
         types = item.get("@type")
         types = {str(x).lower() for x in (types if isinstance(types, list) else [types])}
@@ -481,39 +507,20 @@ def parse_detail(html, candidate):
             data["genres"].extend(clean(x) for x in genre if clean(x))
         elif genre:
             data["genres"].append(clean(genre))
-
     h1 = soup.select_one("h1")
     if h1:
         data["title"] = clean(h1.get_text(" ", strip=True)) or data["title"]
-
     og = soup.select_one("meta[property='og:image']")
     if og and og.get("content") and not data["cover"]:
         data["cover"] = urljoin(BASE, og["content"])
-
     if not data["author"]:
         authors = []
         for selector in ("a[href*='/authors/']", "a[href*='/author/']"):
             authors.extend(clean(x.get_text(" ", strip=True)) for x in soup.select(selector))
         data["author"] = ", ".join(dict.fromkeys(x for x in authors if x)) or None
-
-    data["publisher"] = (
-        meta.get("Wydawca audiobooka")
-        or meta.get("Wydawca e-booka")
-        or meta.get("Wydawca")
-        or data["publisher"]
-    )
-    data["publishedYear"] = (
-        parse_year(meta.get("Data publikacji audiobooka"))
-        or parse_year(meta.get("Oryginalny rok publikacji"))
-        or data["publishedYear"]
-    )
-    data["isbn"] = (
-        meta.get("Numer ISBN audiobooka")
-        or meta.get("Numer ISBN e-book")
-        or meta.get("ISBN")
-        or data["isbn"]
-    )
-
+    data["publisher"] = meta.get("Wydawca audiobooka") or meta.get("Wydawca e-booka") or meta.get("Wydawca") or data["publisher"]
+    data["publishedYear"] = parse_year(meta.get("Data publikacji audiobooka")) or parse_year(meta.get("Oryginalny rok publikacji")) or data["publishedYear"]
+    data["isbn"] = meta.get("Numer ISBN audiobooka") or meta.get("Numer ISBN e-book") or meta.get("ISBN") or data["isbn"]
     duration = None
     for text in soup.stripped_strings:
         value = clean(text)
@@ -523,7 +530,6 @@ def parse_detail(html, candidate):
     data["duration"] = duration
     data["genres"] = genres_from_bookbeat(soup) or list(dict.fromkeys(x for x in data["genres"] if x))
     data["series"], data["sequence"] = series_from_bookbeat(soup, flat)
-
     return data
 
 
@@ -566,14 +572,9 @@ async def bookbeat_search(query, author=""):
     if cached and time.time() - cached[0] < CACHE_TTL:
         print(f"[BookBeat] cache hit: {key}")
         return cached[1]
-
     candidates = await search_page(query)
     if author:
-        candidates.sort(
-            key=lambda item: similarity(item.get("title"), query) * 0.75
-            + similarity((item.get("authors") or [""])[0], author) * 0.25,
-            reverse=True,
-        )
+        candidates.sort(key=lambda item: similarity(item.get("title"), query) * 0.75 + similarity((item.get("authors") or [""])[0], author) * 0.25, reverse=True)
     else:
         candidates.sort(key=lambda item: similarity(item.get("title"), query), reverse=True)
     candidates = candidates[:20]
@@ -591,18 +592,12 @@ async def bookbeat_search(query, author=""):
                 if browser_html:
                     rendered = parse_detail(browser_html, item)
                     data = merge_missing(data, rendered)
-
             ts = similarity(data.get("title"), query)
             aa = similarity(data.get("author"), author) if author else 1.0
             score = ts * 0.75 + aa * 0.25 if author else ts
             if data.get("language") == "pol":
                 score = min(1.0, score + 0.02)
-            print(
-                f"[BookBeat] detail: {data.get('title')} / {data.get('author')} score={score:.3f} "
-                f"narrator={data.get('narrator')} publisher={data.get('publisher')} "
-                f"year={data.get('publishedYear')} isbn={data.get('isbn')} duration={data.get('duration')} "
-                f"genres={data.get('genres')} series={data.get('series')}#{data.get('sequence')} url={data.get('url')}"
-            )
+            print(f"[BookBeat] detail: {data.get('title')} / {data.get('author')} score={score:.3f} narrator={data.get('narrator')} publisher={data.get('publisher')} year={data.get('publishedYear')} isbn={data.get('isbn')} duration={data.get('duration')} genres={data.get('genres')} series={data.get('series')}#{data.get('sequence')} url={data.get('url')}")
             return score, data
         except Exception as exc:
             print(f"[BookBeat] detail failed: {item['url']} {type(exc).__name__}: {exc}")
@@ -612,7 +607,6 @@ async def bookbeat_search(query, author=""):
     for i in range(0, len(candidates), 8):
         batch = await asyncio.gather(*(enrich(x) for x in candidates[i:i + 8]))
         enriched.extend(x for x in batch if x)
-
     enriched.sort(key=lambda x: x[0], reverse=True)
     final = []
     for score, data in enriched:
@@ -621,7 +615,6 @@ async def bookbeat_search(query, author=""):
         final.append(match_result(data, score))
         if len(final) >= MAX_RESULTS:
             break
-
     result = {"matches": final}
     print("[BookBeat] final:", " | ".join(f"{x['title']}/{x['author']} [{x['similarity']:.3f}]" for x in final))
     if final:
@@ -635,11 +628,7 @@ async def health():
 
 
 @app.get("/search")
-async def search(
-    query: str = Query(..., min_length=1),
-    author: str = Query(""),
-    authorization: str | None = Header(default=None),
-):
+async def search(query: str = Query(..., min_length=1), author: str = Query(""), authorization: str | None = Header(default=None)):
     if authorization is None:
         raise HTTPException(status_code=401, detail="Missing Authorization header")
     return JSONResponse(await bookbeat_search(query, author))
