@@ -1,67 +1,71 @@
-# Storytel.pl-ADB
+# Polskie Meta dla Audiobookshelf
 
-Provider metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/) korzystający z publicznie dostępnego katalogu [Storytel Polska](https://www.storytel.com/pl).
+Jeden kontener z providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/) opartymi o polskie katalogi audiobooków.
 
-Projekt jest przeznaczony przede wszystkim do wyszukiwania **polskich wydań audiobooków** i pobierania ich metadanych bezpośrednio ze Storytel.
-## Funkcje
+Obecnie obsługiwane są:
 
-- wyszukiwanie audiobooków po tytule;
-- opcjonalne dopasowanie autora;
-- wyszukiwanie bezpośrednio w polskim katalogu Storytel;
-- obsługa stron renderowanych po stronie klienta dzięki Playwright;
-- pobieranie metadanych potrzebnych Audiobookshelfowi;
-- tytuł, autor, lektor, wydawca, opis, okładka, ISBN, rok wydania, język, czas trwania, gatunki i seria;
-- ranking wyników na podstawie podobieństwa tytułu i autora;
-- prosty cache w pamięci ograniczający liczbę powtarzanych zapytań;
-- endpoint `/health` do sprawdzania stanu kontenera;
-- gotowe pliki Docker i Docker Compose.
+- **Storytel Polska**
+- **Audioteka Polska**
+
+Projekt korzysta z jednego wspólnego środowiska Playwright/Chromium. Każdy provider ma własną logikę wyszukiwania i ekstrakcji metadanych, ale nie wymaga osobnego kontenera.
+
+## Obsługiwane providery
+
+| Provider | Katalog | Port | Endpoint |
+|---|---|---:|---|
+| Storytel Polska | `storytel.com/pl` | `3000` | `/search?provider=storytel` |
+| Audioteka Polska | `audioteka.com/pl` | `3001` | `/search?provider=audioteka` |
 
 ## Jak to działa
 
-Storytel Polska korzysta z aplikacji internetowej renderowanej przez JavaScript. Zwykłe pobranie strony HTTP nie zawsze zawiera wyniki wyszukiwania widoczne w przeglądarce.
+Storytel i Audioteka korzystają z nowoczesnych stron renderowanych przez JavaScript. Dlatego zwykłe pobranie HTML nie zawsze daje te same wyniki, które są widoczne w przeglądarce.
 
-Dlatego provider korzysta z Playwright i prawdziwego silnika Chromium:
+Providery wykorzystują wspólny Chromium uruchamiany przez Playwright:
 
 ```text
 Audiobookshelf
       │
       ▼
-GET /search
+Polskie Meta dla ABS
       │
-      ▼
-Storytel Polska
+      ├──────────────► Storytel Polska
+      │                    port 3000
       │
-      ▼
-wyszukiwanie renderowane w Chromium
-      │
-      ▼
-strony książek /pl/books/...
-      │
-      ▼
-metadane książki
-      │
-      ▼
-format odpowiedzi Audiobookshelf
+      └──────────────► Audioteka Polska
+                           port 3001
 ```
 
-Dzięki temu wyszukiwanie opiera się na tym samym katalogu, który jest dostępny użytkownikowi w przeglądarce Storytel Polska.
+Wyniki są następnie zamieniane na format metadanych odpowiedni dla Audiobookshelf.
 
-## Instalacja przez Docker
+## Pobierane metadane
 
-Sklonuj repozytorium:
+Providery starają się zwracać najważniejsze informacje o audiobooku:
+
+- tytuł;
+- autor;
+- lektor;
+- wydawca;
+- opis;
+- okładka;
+- ISBN;
+- rok wydania;
+- język;
+- czas trwania w minutach;
+- gatunki;
+- seria i numer w serii;
+- wynik podobieństwa.
+
+Źródłem danych są bezpośrednio polskie katalogi Storytel i Audioteka. Priorytetem są **polskie wydania i polskie dane katalogowe**.
+
+## Uruchomienie
+
+Wymagany jest Docker z Docker Compose.
 
 ```bash
 git clone https://github.com/60plus/Storytel.pl-ADB.git
 cd Storytel.pl-ADB
-```
-
-Uruchom kontener:
-
-```bash
 docker compose up -d --build
 ```
-
-Domyślnie provider nasłuchuje na porcie `3000`.
 
 Sprawdzenie kontenera:
 
@@ -81,55 +85,58 @@ Zatrzymanie:
 docker compose down
 ```
 
-## Konfiguracja portu
+## Storytel Polska
 
-Port można zmienić za pomocą zmiennej środowiskowej `PORT`.
+Provider korzysta z polskiego wyszukiwania Storytel oraz z indywidualnych stron książek.
 
-Przykład:
-
-```yaml
-services:
-  storytel-pl-abs:
-    build: .
-    ports:
-      - "3000:3000"
-    environment:
-      PORT: 3000
-```
-
-## Integracja z Audiobookshelf
-
-W Audiobookshelf dodaj provider metadanych jako własny / niestandardowy provider zgodnie z konfiguracją używanej wersji Audiobookshelf.
-
-Adres providera powinien wskazywać na kontener lub host, na którym działa aplikacja, np.:
+Adres providera:
 
 ```text
 http://adres-serwera:3000
 ```
-
-Endpoint wyszukiwania providera:
-
-```text
-GET /search
-```
-
-Provider wymaga nagłówka `Authorization`. Wartość nagłówka nie jest obecnie używana do autoryzacji zewnętrznego konta Storytel — służy zgodności z interfejsem providera metadanych.
-
-## API
-
-### `GET /search`
-
-Parametry:
-
-- `query` — wymagany tytuł książki;
-- `author` — opcjonalny autor.
 
 Przykład:
 
 ```bash
 curl -s \
   -H 'Authorization: test' \
-  'http://localhost:3000/search?query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
+  'http://localhost:3000/search?provider=storytel&query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
+```
+
+## Audioteka Polska
+
+Provider korzysta z polskiego katalogu Audioteka i z tego samego środowiska Chromium, które jest używane przez Storytel.
+
+Adres providera:
+
+```text
+http://adres-serwera:3001
+```
+
+Przykład:
+
+```bash
+curl -s \
+  -H 'Authorization: test' \
+  'http://localhost:3001/search?provider=audioteka&query=Mazurski%20przekr%C4%99t'
+```
+
+Parser Audioteki jest przygotowany również na pozycje będące audioserialami i seriami, dlatego nie ogranicza się wyłącznie do klasycznych książek.
+
+## Wspólne API
+
+### `GET /search`
+
+Parametry:
+
+- `provider` — `storytel` albo `audioteka`;
+- `query` — wymagany tytuł;
+- `author` — opcjonalny autor.
+
+Wymagany jest nagłówek:
+
+```http
+Authorization: <dowolna-wartość>
 ```
 
 Przykładowa odpowiedź:
@@ -138,42 +145,33 @@ Przykładowa odpowiedź:
 {
   "matches": [
     {
-      "title": "Wywyższenie Horusa",
-      "author": "Dan Abnett",
-      "narrator": "Filip Kosior",
-      "publisher": "Copernicus Corporation",
-      "publishedYear": "2022",
+      "title": "...",
+      "author": "...",
+      "narrator": "...",
+      "publisher": "...",
+      "publishedYear": "2024",
       "description": "...",
-      "cover": "https://covers.storytel.com/...",
-      "isbn": "9788386758937",
-      "genres": ["Fantasy"],
+      "cover": "https://...",
+      "isbn": "...",
+      "genres": ["..."],
       "series": [
         {
-          "series": "Herezja Horusa",
+          "series": "...",
           "sequence": "1"
         }
       ],
       "language": "pol",
-      "duration": 757,
+      "duration": 696,
       "type": "audiobook",
       "similarity": 1.0
     }
   ]
 }
 ```
-`duration` jest zwracane w minutach, zgodnie z wymaganiami Audiobookshelf.
 
-<img width="3840" height="1990" alt="Screenshot 2026-08-25 at 16-06-20 Audiobookshelf" src="https://github.com/user-attachments/assets/9e31944a-4cbd-4dc9-bfc2-5830e7e44726" />
-
-<img width="3840" height="1990" alt="Screenshot 2026-08-25 at 16-06-48 Audiobookshelf" src="https://github.com/user-attachments/assets/f6307bec-b89e-410e-a9f5-6d5a69aa6a2e" />
-
-
-
-
+`duration` jest podawane w minutach.
 
 ### `GET /health`
-
-Endpoint kontrolny:
 
 ```bash
 curl http://localhost:3000/health
@@ -184,6 +182,36 @@ Odpowiedź:
 ```json
 {"status":"ok"}
 ```
+
+### `GET /providers`
+
+```bash
+curl -s \
+  -H 'Authorization: test' \
+  'http://localhost:3000/providers'
+```
+
+Zwraca listę dostępnych providerów.
+
+## Audiobookshelf
+
+W Audiobookshelf możesz dodać każdy provider jako osobny niestandardowy provider metadanych.
+
+### Storytel Polska
+
+```text
+Nazwa: Storytel Polska
+URL: http://adres-serwera:3000
+```
+
+### Audioteka Polska
+
+```text
+Nazwa: Audioteka Polska
+URL: http://adres-serwera:3001
+```
+
+Niestandardowe providery metadanych dodaje się w ustawieniach Audiobookshelf. citeturn883065search0
 
 ## Struktura projektu
 
@@ -196,22 +224,37 @@ Odpowiedź:
 └── README.md
 ```
 
-## Wymagania
+## Architektura
 
-Projekt korzysta z:
+Jeden kontener współdzieli:
 
-- Python 3;
 - FastAPI;
-- Uvicorn;
 - Playwright;
-- Chromium dostarczanego przez obraz Playwright.
+- Chromium;
+- cache;
+- mechanizmy normalizacji i rankingu.
 
-Wszystkie wymagane zależności są zdefiniowane w `requirements.txt`, a środowisko przeglądarkowe jest dostarczane przez obraz Docker używany w `Dockerfile`.
+Każdy provider ma własne:
 
-## Dane i zakres działania
+- adresy wyszukiwania;
+- selektory stron;
+- parser metadanych;
+- zasady dopasowania wyników.
 
-Źródłem danych jest **Storytel Polska** (`storytel.com/pl`). Provider jest nastawiony na polski katalog i polskie wydania audiobooków.
+Dzięki temu dodanie kolejnego polskiego źródła nie wymaga uruchamiania kolejnego kontenera.
 
-Projekt nie wymaga logowania do konta Storytel. Pobierane są informacje dostępne publicznie na stronach Storytel.
+## Dodawanie kolejnego providera
 
-Storytel może w przyszłości zmienić sposób działania swojej strony, strukturę HTML lub mechanizm wyszukiwania. W takim przypadku selektory i sposób ekstrakcji metadanych mogą wymagać aktualizacji.
+Nowy provider powinien:
+
+1. wyszukiwać pozycje w swoim katalogu;
+2. pobierać stronę szczegółową;
+3. wyciągać potrzebne metadane;
+4. oceniać dopasowanie tytułu i autora;
+5. zwracać wynik w formacie Audiobookshelf.
+
+## Uwagi
+
+Struktura stron Storytel i Audioteka może się zmieniać. W przypadku zmiany HTML, routingu lub sposobu renderowania strony odpowiedni parser może wymagać aktualizacji.
+
+Projekt pobiera dane dostępne publicznie na stronach dostawców. Prawa do treści, opisów, okładek i innych materiałów źródłowych pozostają przy ich właścicielach.
