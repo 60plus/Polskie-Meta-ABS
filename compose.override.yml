@@ -1,4 +1,0 @@
-services:
-  polskie-meta-abs:
-    ports:
-      - "3002:3002"
