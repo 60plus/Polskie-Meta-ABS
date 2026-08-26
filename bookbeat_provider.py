@@ -19,11 +19,11 @@ SEARCH = f"{PL}/search"
 CACHE_TTL = 600
 MAX_RESULTS = 10
 _http = None
-_http_lock = asyncio.Lock()
 _browser = None
 _browser_context = None
 _browser_page = None
 _browser_lock = asyncio.Lock()
+_http_lock = asyncio.Lock()
 _cache = {}
 
 HEADERS = {
@@ -69,6 +69,8 @@ def parse_year(value):
 
 def parse_duration(value):
     text = str(value or "")
+    if not text:
+        return None
     h = re.search(r"(\d+)\s*(?:godz\.?|godziny|godzin|h)\b", text, re.I)
     m = re.search(r"(\d+)\s*(?:min\.?|minut|m)\b", text, re.I)
     if h:
@@ -190,7 +192,7 @@ async def browser_search_page(query):
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             try:
-                await page.locator("a[data-testid='book-card'], a[href*='/pl/book/']").first.wait_for(timeout=7000)
+                await page.locator("a[data-testid='book-card']").first.wait_for(timeout=7000)
             except Exception:
                 pass
             found = parse_search_html(await page.content())
@@ -202,37 +204,31 @@ async def browser_search_page(query):
 
 
 async def browser_detail_page(url):
+    """Fetch the fully rendered detail DOM, including lazy-loaded metadata."""
     async with _browser_lock:
         try:
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
 
-            # BookBeat fills the secondary metadata after the initial DOM.
-            # Do not wait on the first matching selector: description can be
-            # present before publisher/ISBN/year are rendered.
-            labels = [
-                "Oryginalny rok publikacji",
-                "Data publikacji audiobooka",
-                "Wydawca audiobooka",
-                "Wydawca e-booka",
-                "Numer ISBN audiobooka",
-                "Numer ISBN e-book",
-                "Kategorie",
-            ]
-            label_selector = ", ".join(f"[aria-label={json.dumps(x)}]" for x in labels)
+            # BookBeat renders the secondary metadata lazily. Scroll through the
+            # page so publisher/ISBN/publication date/category rows are mounted.
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(1200)
+            await page.evaluate("window.scrollTo(0, document.body.scrollHeight)")
+            await page.wait_for_timeout(800)
+
             try:
-                await page.locator(label_selector).first.wait_for(timeout=10000)
+                await page.locator(
+                    "[aria-label='Oryginalny rok publikacji'], "
+                    "[aria-label='Data publikacji audiobooka'], "
+                    "[aria-label='Wydawca audiobooka'], "
+                    "[aria-label='Numer ISBN audiobooka'], "
+                    "[aria-label='Wydawca e-booka'], "
+                    "[aria-label='Numer ISBN e-book']"
+                ).first.wait_for(timeout=5000)
             except Exception:
                 pass
 
-            # Give the secondary metadata a short chance to finish mounting.
-            try:
-                await page.wait_for_function(
-                    """() => document.querySelectorAll("[aria-label='Wydawca audiobooka'], [aria-label='Wydawca e-booka'], [aria-label='Numer ISBN audiobooka'], [aria-label='Numer ISBN e-book'], [aria-label='Data publikacji audiobooka'], [aria-label='Oryginalny rok publikacji']").length > 0""",
-                    timeout=5000,
-                )
-            except Exception:
-                pass
             return await page.content()
         except Exception as exc:
             print(f"[BookBeat] browser detail failed: {url} {type(exc).__name__}: {exc}")
@@ -323,8 +319,6 @@ async def search_page(query):
 
 
 def _value_after_label(node):
-    # BookBeat structure: label <p> and value <p> are siblings in the same
-    # metadata row. Also handle a wrapper where the value is the next element.
     parent = node.parent
     if parent:
         children = [x for x in parent.find_all(recursive=False) if getattr(x, "name", None)]
@@ -509,7 +503,6 @@ def parse_detail(html, candidate):
     data["duration"] = duration
     data["genres"] = genres_from_bookbeat(soup) or list(dict.fromkeys(x for x in data["genres"] if x))
     data["series"], data["sequence"] = series_from_bookbeat(soup, flat)
-
     return data
 
 
