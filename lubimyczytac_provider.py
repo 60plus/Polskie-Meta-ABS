@@ -11,10 +11,9 @@ from fastapi.responses import JSONResponse
 from playwright.async_api import async_playwright
 
 app = FastAPI(title="Lubimyczytać Metadata Provider")
-
 BASE = "https://lubimyczytac.pl"
 CACHE_TTL = 600
-MAX_RESULTS = 10
+MAX_RESULTS = 20
 _pw = _browser = _context = None
 _lock = asyncio.Lock()
 _cache = {}
@@ -52,14 +51,14 @@ def parse_year(value):
 
 def parse_duration(value):
     text = str(value or "")
+    iso = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", text, re.I)
+    if iso:
+        return int(iso.group(1) or 0) * 60 + int(iso.group(2) or 0) + round(int(iso.group(3) or 0) / 60)
     h = re.search(r"(\d+)\s*(?:godz\.?|godziny|godzin|h)\b", text, re.I)
     m = re.search(r"(\d+)\s*(?:min\.?|minut|m)\b", text, re.I)
-    if not h and not m:
-        iso = re.fullmatch(r"PT(?:(\d+)H)?(?:(\d+)M)?(?:(\d+)S)?", text, re.I)
-        if iso:
-            return int(iso.group(1) or 0) * 60 + int(iso.group(2) or 0) + round(int(iso.group(3) or 0) / 60)
-        return None
-    return int(h.group(1)) * 60 + int(m.group(1) if m else 0) if h else int(m.group(1))
+    if h:
+        return int(h.group(1)) * 60 + int(m.group(1) if m else 0)
+    return int(m.group(1)) if m else None
 
 
 def jsonld_objects(raw):
@@ -98,6 +97,10 @@ def is_book_url(url):
     return path.startswith("/ksiazka/") or path.startswith("/audiobook/")
 
 
+def path_type(url):
+    return "audiobook" if urlparse(url).path.rstrip("/").startswith("/audiobook/") else "book"
+
+
 def url_title(url):
     slug = urlparse(url).path.rstrip("/").split("/")[-1]
     return re.sub(r"[-_]+", " ", slug).strip()
@@ -110,26 +113,36 @@ def lines_from_body(body):
 def value_after_label(lines, labels):
     wanted = {norm(x) for x in labels}
     for i, line in enumerate(lines):
-        if norm(line) in wanted:
-            for candidate in lines[i + 1:i + 4]:
-                if candidate and norm(candidate) not in wanted:
-                    return candidate
+        if norm(line) not in wanted:
+            continue
+        for candidate in lines[i + 1:i + 5]:
+            if candidate and norm(candidate) not in wanted:
+                return candidate
     return None
 
 
 def series_from_lines(lines):
     for i, line in enumerate(lines):
-        if norm(line) in {"cykl", "seria"}:
-            if i + 1 < len(lines):
-                value = lines[i + 1]
-                m = re.match(r"(.+?)\s*\(tom\s+([0-9IVX]+)\)", value, re.I)
-                if m:
-                    return clean(m.group(1)), m.group(2)
-                return clean(value), None
+        if norm(line) in {"cykl", "seria"} and i + 1 < len(lines):
+            value = lines[i + 1]
+            m = re.match(r"(.+?)\s*\(tom\s+([0-9IVX]+)\)", value, re.I)
+            if m:
+                return clean(m.group(1)), m.group(2)
+            return clean(value), None
         m = re.match(r"(?:Cykl|Seria):?\s*(.+?)(?:\s*\(tom\s+([0-9IVX]+)\))?$", line, re.I)
         if m:
             return clean(m.group(1)), m.group(2)
     return None, None
+
+
+def decode_text(value):
+    value = value or ""
+    # Search pages normally arrive as proper UTF-8 in Chromium. Keep a small
+    # compatibility fix for escaped mojibake sometimes emitted by old markup.
+    replacements = {"\u00c4\u0085": "ą", "\u00c4\u0099": "ę", "\u00c5\u0082": "ł", "\u00c5\u009b": "ś"}
+    for a, b in replacements.items():
+        value = value.replace(a, b)
+    return value
 
 
 async def get_context():
@@ -146,74 +159,74 @@ async def get_context():
             locale="pl-PL",
             timezone_id="Europe/Warsaw",
             viewport={"width": 1440, "height": 1000},
-            user_agent=("Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 "
-                        "(KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"),
+            user_agent="Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 Chrome/131.0.0.0 Safari/537.36",
             extra_http_headers={"Accept-Language": "pl-PL,pl;q=0.9,en;q=0.7"},
         )
         return _context
 
 
-async def open_page(page, url, wait=500):
+async def open_page(page, url, wait=250):
     await page.goto(url, wait_until="domcontentloaded", timeout=15000)
     await page.wait_for_timeout(wait)
 
 
-async def search_page(page, query):
-    # LC currently exposes the global search as /szukaj?phrase=... . Keep the
-    # trailing-slash variant as a fallback because the site has used both.
-    urls = [
-        f"{BASE}/szukaj?phrase={quote(query)}",
-        f"{BASE}/szukaj/?phrase={quote(query)}",
-    ]
-    for search_url in urls:
+async def search_page(page, query, section=None):
+    # Match the native provider's strategy: query the dedicated book and
+    # audiobook search pages rather than only the global result page.
+    search_urls = []
+    if section:
+        search_urls.append(f"{BASE}/szukaj/{section}?phrase={quote(query)}")
+    else:
+        search_urls.extend([
+            f"{BASE}/szukaj/ksiazki?phrase={quote(query)}",
+            f"{BASE}/szukaj/audiobooki?phrase={quote(query)}",
+        ])
+
+    found, seen = [], set()
+    for search_url in search_urls:
         try:
             print(f"[Lubimyczytać] search: {search_url}")
-            await open_page(page, search_url, 650)
+            await open_page(page, search_url, 350)
             hrefs = await page.locator("a[href]").evaluate_all("els => els.map(a => a.href).filter(Boolean)")
-            found, seen = [], set()
             for href in hrefs:
                 parsed = urlparse(href)
-                if parsed.netloc not in {"lubimyczytac.pl", "www.lubimyczytac.pl"}:
-                    continue
-                if not is_book_url(href):
+                if parsed.netloc not in {"lubimyczytac.pl", "www.lubimyczytac.pl"} or not is_book_url(href):
                     continue
                 u = canonical(href)
                 if u not in seen:
                     seen.add(u)
                     found.append(u)
-            print(f"[Lubimyczytać] '{query}' -> {len(found)} książka/audiobook URL")
-            if found:
-                return found
         except Exception as exc:
-            print(f"[Lubimyczytać] search miss: {type(exc).__name__}: {exc}")
-    return []
+            print(f"[Lubimyczytać] search miss {search_url}: {type(exc).__name__}: {exc}")
+    print(f"[Lubimyczytać] '{query}' -> {len(found)} książka/audiobook URL")
+    return found
 
 
 async def parse_detail(page, url, query, author=""):
-    await open_page(page, url, 350)
-    body = await page.locator("body").inner_text()
+    await open_page(page, url, 250)
+    body = decode_text(await page.locator("body").inner_text())
     lines = lines_from_body(body)
     data = {
         "title": None, "author": None, "narrator": None, "publisher": None,
-        "publishedYear": None, "description": None, "cover": None,
-        "isbn": None, "duration": None, "genres": [], "series": None,
-        "sequence": None, "url": canonical(url), "format": None,
+        "publishedYear": None, "description": None, "cover": None, "isbn": None,
+        "duration": None, "genres": [], "series": None, "sequence": None,
+        "url": canonical(url), "type": path_type(url), "rating": None,
     }
 
+    # JSON-LD is only used as one source. We still explicitly parse the page
+    # fields because LC exposes richer book/audiobook data there.
     objects = []
     for raw in await page.locator("script[type='application/ld+json']").all_text_contents():
         objects.extend(jsonld_objects(raw))
-
     target = None
-    best = 0.0
+    best = -1.0
     for item in objects:
         name = clean(item.get("name"))
         if not name:
             continue
         score = similarity(name, query)
         if score > best:
-            best = score
-            target = item
+            target, best = item, score
 
     if target:
         data["title"] = clean(target.get("name"))
@@ -239,30 +252,42 @@ async def parse_detail(page, url, query, author=""):
     h1 = clean(await page.locator("h1").first.text_content()) if await page.locator("h1").count() else None
     data["title"] = h1 or data["title"] or url_title(url)
 
-    # The description is deliberately taken from the dedicated LC block.
-    # It is the same element for ordinary books and audiobook pages.
+    # CRITICAL: LC's real description is #book-description for both books and
+    # audiobooks. text_content() keeps the content even when collapsed by the
+    # "więcej" button and removes the HTML tags for ABS.
     try:
         description = page.locator("#book-description").first
         if await description.count():
+            await description.wait_for(state="attached", timeout=1800)
             value = clean(await description.text_content())
             if value:
                 data["description"] = value
-                print(f"[Lubimyczytać] description: chars={len(value)}")
+                print(f"[Lubimyczytać] description: chars={len(value)} type={data['type']} url={data['url']}")
     except Exception as exc:
         print(f"[Lubimyczytać] description failed: {type(exc).__name__}")
 
-    for selector, key in (
-        ("meta[property='og:image']", "cover"),
-        ("meta[property='og:description']", "description"),
-    ):
+    # Covers: use several known LC locations, including the audiobook
+    # rectangle cover when available.
+    cover_selectors = [
+        "a#js-lightboxCover[href]",
+        ".book-cover__link[href]",
+        "meta[property='og:image']",
+        "meta[name='twitter:image']",
+        "img.book-cover[src]",
+    ]
+    for selector in cover_selectors:
         try:
-            value = clean(await page.locator(selector).get_attribute("content"))
-            if value and not data[key]:
-                data[key] = value
+            loc = page.locator(selector).first
+            if not await loc.count():
+                continue
+            value = clean(await loc.get_attribute("href") or await loc.get_attribute("content") or await loc.get_attribute("src"))
+            if value:
+                data["cover"] = value
+                break
         except Exception:
             pass
 
-    # Authors: prefer JSON-LD, then explicit author links.
+    # Author: dedicated author links are preferable to generic text on the page.
     if not data["author"]:
         try:
             names = await page.locator("a[href*='/autor/']").all_text_contents()
@@ -273,18 +298,19 @@ async def parse_detail(page, url, query, author=""):
             pass
 
     data["publisher"] = data["publisher"] or value_after_label(lines, ["Wydawca", "Wydawnictwo"])
-    data["format"] = value_after_label(lines, ["Format"])
     data["publishedYear"] = data["publishedYear"] or parse_year(value_after_label(lines, [
-        "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"
+        "Data pierwszego wydania", "Data wydania", "Data 1. wyd. pol.", "Data publikacji", "Data premiery", "Rok wydania"
     ]))
     data["isbn"] = data["isbn"] or value_after_label(lines, ["ISBN"])
     data["duration"] = data["duration"] or parse_duration(value_after_label(lines, ["Czas czytania", "Długość", "Czas trwania"]))
 
+    # Audiobook performers are important metadata and are distinct from author.
+    narrator = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
+    if narrator:
+        data["narrator"] = narrator
+
     language = value_after_label(lines, ["Język"])
-    if language and norm(language) in {"polski", "polska", "pol"}:
-        data["language"] = "pol"
-    else:
-        data["language"] = "pol"
+    data["language"] = "pol" if not language or norm(language) in {"polski", "polska", "pol"} else norm(language)
 
     category = value_after_label(lines, ["Kategoria", "Kategorie"])
     if category:
@@ -293,11 +319,12 @@ async def parse_detail(page, url, query, author=""):
     series, sequence = series_from_lines(lines)
     data["series"], data["sequence"] = series, sequence
 
-    # Audiobook pages can expose the narrator/performers in labels such as
-    # Lektor, Czyta or Lektorzy. Keep this separate from the author.
-    narrator = value_after_label(lines, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
-    if narrator:
-        data["narrator"] = narrator
+    try:
+        rating = await page.locator("meta[property='books:rating:value']").get_attribute("content")
+        if rating:
+            data["rating"] = float(rating) / 2
+    except Exception:
+        pass
 
     if not data["isbn"]:
         m = re.search(r"\b(97[89]\d{10})\b", body)
@@ -310,11 +337,17 @@ async def parse_detail(page, url, query, author=""):
 
 
 def score(data, query, author):
-    ts = similarity(data.get("title"), query)
-    aa = similarity(data.get("author"), author) if author else 1.0
+    title_score = similarity(data.get("title"), query)
+    author_score = similarity(data.get("author"), author) if author else 1.0
     if author and not data.get("author"):
-        aa = 0.55
-    return ts * 0.78 + aa * 0.22 if author else ts
+        author_score = 0.55
+    value = title_score * 0.60 + author_score * 0.40 if author else title_score
+    # Same behavior as the proven LC provider: a very strong match without
+    # ISBN is only slightly penalized; ISBN=0 can later be used by ABS to avoid
+    # repeatedly matching the same item.
+    if not data.get("isbn"):
+        value *= 0.99
+    return min(1.0, value), title_score, author_score
 
 
 def to_match(data, score_value):
@@ -331,8 +364,9 @@ def to_match(data, score_value):
         "series": ([{"series": data["series"], "sequence": data.get("sequence")}] if data.get("series") else None),
         "language": data.get("language", "pol"),
         "duration": data.get("duration"),
-        "type": "audiobook" if "/audiobook/" in data.get("url", "") else "book",
-        "similarity": score_value,
+        "rating": data.get("rating"),
+        "type": data.get("type", "book"),
+        "similarity": round(score_value, 3),
     }
 
 
@@ -343,43 +377,63 @@ async def lubimyczytac_search(query, author=""):
         return cached[1]
 
     context = await get_context()
-    search = await context.new_page()
+    search_page_obj = await context.new_page()
     try:
-        urls = await search_page(search, query)
-        if not urls and author:
-            urls = await search_page(search, f"{query} {author}")
+        urls = await search_page(search_page_obj, query)
+        if author:
+            author_urls = await search_page(search_page_obj, f"{query} {author}")
+            urls = list(dict.fromkeys(urls + author_urls))
     finally:
-        await search.close()
+        await search_page_obj.close()
 
-    urls = list(dict.fromkeys(urls))[:30]
-    books = []
-    for i in range(0, len(urls), 4):
-        pages = [await context.new_page() for _ in urls[i:i + 4]]
+    # The reference provider returns up to 20 candidates. Parse the most
+    # promising URLs first, but keep both books and audiobooks in the pool.
+    urls = list(dict.fromkeys(urls))[:40]
+    candidates = []
+    for i in range(0, len(urls), 6):
+        batch = urls[i:i + 6]
+        pages = [await context.new_page() for _ in batch]
         try:
-            books.extend(await asyncio.gather(*(
-                parse_detail(p, u, query, author)
-                for p, u in zip(pages, urls[i:i + 4])
-            )))
+            results = await asyncio.gather(*(
+                parse_detail(page, url, query, author)
+                for page, url in zip(pages, batch)
+            ), return_exceptions=True)
+            for result in results:
+                if isinstance(result, Exception):
+                    print(f"[Lubimyczytać] detail failed: {type(result).__name__}: {result}")
+                else:
+                    candidates.append(result)
         finally:
             await asyncio.gather(*(p.close() for p in pages), return_exceptions=True)
 
     ranked = []
-    for book in books:
-        ts = similarity(book.get("title"), query)
-        aa = similarity(book.get("author"), author) if author else 1.0
-        s = score(book, query, author)
-        ranked.append((s, ts, aa, book))
-    ranked.sort(key=lambda x: x[0], reverse=True)
+    seen_keys = set()
+    for data in candidates:
+        title_key = norm(data.get("title"))
+        author_key = norm(data.get("author"))
+        key2 = (title_key, author_key, data.get("type"), data.get("isbn"))
+        if key2 in seen_keys:
+            continue
+        seen_keys.add(key2)
+        s, ts, aa = score(data, query, author)
+        ranked.append((s, ts, aa, data))
+
+    ranked.sort(key=lambda item: (
+        item[0],
+        1 if item[3].get("type") == "audiobook" else 0,
+        1 if item[3].get("isbn") else 0,
+    ), reverse=True)
 
     final = [
-        to_match(book, round(min(1.0, s), 3))
-        for s, ts, aa, book in ranked
-        if ts >= 0.55 and (not author or aa >= 0.45)
+        to_match(data, s)
+        for s, ts, aa, data in ranked
+        if ts >= 0.55 and (not author or aa >= 0.40)
     ][:MAX_RESULTS]
 
     result = {"matches": final}
     print("[Lubimyczytać] final:", " | ".join(
-        f"{x['title']}/{x['author']} ({x['similarity']:.3f})" for x in final
+        f"{x['title']}/{x['author']} [{x['type']}] ({x['similarity']:.3f})"
+        for x in final
     ))
     _cache[key] = (time.time(), result)
     return result
