@@ -19,11 +19,11 @@ SEARCH = f"{PL}/search"
 CACHE_TTL = 600
 MAX_RESULTS = 10
 _http = None
+_http_lock = asyncio.Lock()
 _browser = None
 _browser_context = None
 _browser_page = None
 _browser_lock = asyncio.Lock()
-_http_lock = asyncio.Lock()
 _cache = {}
 
 HEADERS = {
@@ -69,8 +69,6 @@ def parse_year(value):
 
 def parse_duration(value):
     text = str(value or "")
-    if not text:
-        return None
     h = re.search(r"(\d+)\s*(?:godz\.?|godziny|godzin|h)\b", text, re.I)
     m = re.search(r"(\d+)\s*(?:min\.?|minut|m)\b", text, re.I)
     if h:
@@ -153,10 +151,7 @@ async def fetch_html(url):
     client = await get_http()
     for attempt in range(1, 3):
         try:
-            response = await client.get(
-                url,
-                headers={"Referer": f"{PL}/", "Sec-Fetch-Site": "same-origin"},
-            )
+            response = await client.get(url, headers={"Referer": f"{PL}/", "Sec-Fetch-Site": "same-origin"})
             if response.status_code == 429:
                 await asyncio.sleep(attempt)
                 continue
@@ -195,7 +190,7 @@ async def browser_search_page(query):
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
             try:
-                await page.locator("a[data-testid='book-card']").first.wait_for(timeout=7000)
+                await page.locator("a[data-testid='book-card'], a[href*='/pl/book/']").first.wait_for(timeout=7000)
             except Exception:
                 pass
             found = parse_search_html(await page.content())
@@ -207,16 +202,35 @@ async def browser_search_page(query):
 
 
 async def browser_detail_page(url):
-    """Fetch the rendered BookBeat detail DOM only when HTTP metadata is incomplete."""
     async with _browser_lock:
         try:
             page = await get_browser_page()
             await page.goto(url, wait_until="domcontentloaded", timeout=30000)
+
+            # BookBeat fills the secondary metadata after the initial DOM.
+            # Do not wait on the first matching selector: description can be
+            # present before publisher/ISBN/year are rendered.
+            labels = [
+                "Oryginalny rok publikacji",
+                "Data publikacji audiobooka",
+                "Wydawca audiobooka",
+                "Wydawca e-booka",
+                "Numer ISBN audiobooka",
+                "Numer ISBN e-book",
+                "Kategorie",
+            ]
+            label_selector = ", ".join(f"[aria-label={json.dumps(x)}]" for x in labels)
             try:
-                await page.locator(
-                    "span[class*='bookInfo_summary'], [aria-label='Wydawca audiobooka'], "
-                    "[aria-label='Numer ISBN audiobooka']"
-                ).first.wait_for(timeout=7000)
+                await page.locator(label_selector).first.wait_for(timeout=10000)
+            except Exception:
+                pass
+
+            # Give the secondary metadata a short chance to finish mounting.
+            try:
+                await page.wait_for_function(
+                    """() => document.querySelectorAll("[aria-label='Wydawca audiobooka'], [aria-label='Wydawca e-booka'], [aria-label='Numer ISBN audiobooka'], [aria-label='Numer ISBN e-book'], [aria-label='Data publikacji audiobooka'], [aria-label='Oryginalny rok publikacji']").length > 0""",
+                    timeout=5000,
+                )
             except Exception:
                 pass
             return await page.content()
@@ -257,9 +271,7 @@ def parse_search_html(html):
             if len(clean(card.get_text(" ", strip=True)) or "") >= 20:
                 break
         title = None
-        for selector in (
-            "[data-testid='book-card-title']", "h1", "h2", "h3", "h4", "[data-testid*='title']"
-        ):
+        for selector in ("[data-testid='book-card-title']", "h1", "h2", "h3", "h4", "[data-testid*='title']"):
             node = card.select_one(selector)
             if node and clean(node.get_text(" ", strip=True)):
                 title = clean(node.get_text(" ", strip=True))
@@ -311,15 +323,24 @@ async def search_page(query):
 
 
 def _value_after_label(node):
-    value_node = node.find_next_sibling()
-    if not value_node and node.parent:
-        siblings = [x for x in node.parent.find_all(recursive=False) if x is not node]
-        value_node = siblings[0] if siblings else None
-    return clean(value_node.get_text(" ", strip=True)) if value_node else None
+    # BookBeat structure: label <p> and value <p> are siblings in the same
+    # metadata row. Also handle a wrapper where the value is the next element.
+    parent = node.parent
+    if parent:
+        children = [x for x in parent.find_all(recursive=False) if getattr(x, "name", None)]
+        try:
+            index = children.index(node)
+        except ValueError:
+            index = -1
+        if index >= 0 and index + 1 < len(children):
+            value = clean(children[index + 1].get_text(" ", strip=True))
+            if value:
+                return value
+    sibling = node.find_next_sibling()
+    return clean(sibling.get_text(" ", strip=True)) if sibling else None
 
 
 def labeled_metadata(soup):
-    """Read BookBeat's visible metadata labels, including publisher/ISBN fallbacks."""
     result = {}
     exact_labels = (
         "Oryginalny rok publikacji",
@@ -330,7 +351,6 @@ def labeled_metadata(soup):
         "Wydawca e-booka",
         "Numer ISBN audiobooka",
         "Numer ISBN e-book",
-        "Kategorie",
     )
     for label in exact_labels:
         for node in soup.find_all(attrs={"aria-label": label}):
@@ -339,14 +359,13 @@ def labeled_metadata(soup):
                 result[label] = value
                 break
 
-    # Some BookBeat pages omit one of the product-specific labels. Keep a
-    # generic fallback so ABS still receives publisher/ISBN instead of null.
     if not result.get("Wydawca audiobooka") and not result.get("Wydawca e-booka"):
         for node in soup.find_all(attrs={"aria-label": re.compile(r"^Wydawca(?: audiobooka| e-booka)?$", re.I)}):
             value = _value_after_label(node)
             if value:
                 result["Wydawca"] = value
                 break
+
     if not result.get("Numer ISBN audiobooka") and not result.get("Numer ISBN e-book"):
         for node in soup.find_all(attrs={"aria-label": re.compile(r"^Numer ISBN(?: audiobooka| e-book)?$", re.I)}):
             value = _value_after_label(node)
@@ -357,20 +376,14 @@ def labeled_metadata(soup):
 
 
 def description_from_bookbeat(soup):
-    node = soup.select_one("span[role='text'][aria-label]")
-    if node:
-        summary = node.select_one("span[class*='bookInfo_summary']")
-        if summary:
-            paragraphs = [clean(p.get_text(" ", strip=True)) for p in summary.select("p")]
-            paragraphs = [p for p in paragraphs if p]
-            if paragraphs:
-                return "\n\n".join(paragraphs)
-    node = soup.select_one("[class*='bookInfo_summary']")
-    if node:
-        paragraphs = [clean(p.get_text(" ", strip=True)) for p in node.select("p")]
-        paragraphs = [p for p in paragraphs if p]
-        return "\n\n".join(paragraphs) if paragraphs else clean(node.get_text(" ", strip=True))
-    return None
+    node = soup.select_one("span[class*='bookInfo_summary']")
+    if not node:
+        node = soup.select_one("span[role='text'][aria-label] span[class*='bookInfo_summary']")
+    if not node:
+        return None
+    paragraphs = [clean(p.get_text(" ", strip=True)) for p in node.select("p")]
+    paragraphs = [p for p in paragraphs if p]
+    return "\n\n".join(paragraphs) if paragraphs else clean(node.get_text(" ", strip=True))
 
 
 def series_from_bookbeat(soup, flat):
@@ -387,9 +400,6 @@ def narrator_from_bookbeat(soup, description):
     m = re.search(r"(?:^|\n)\s*Lektor:\s*([^\n]+)", description or "", re.I)
     if m:
         return clean(m.group(1))
-    for link in soup.find_all("a", href=True):
-        if norm(link.get_text(" ", strip=True)) == "zespol lektorow":
-            return "Zespół lektorów"
     return None
 
 
@@ -414,10 +424,11 @@ def parse_detail(html, candidate):
     flat = soup.get_text("\n", strip=True) or ""
     meta = labeled_metadata(soup)
     description = description_from_bookbeat(soup)
+
     data = {
         "title": candidate.get("title"),
         "author": ", ".join(candidate.get("authors") or []) or None,
-        "narrator": None,
+        "narrator": narrator_from_bookbeat(soup, description),
         "publisher": None,
         "publishedYear": None,
         "description": description,
@@ -460,12 +471,7 @@ def parse_detail(html, candidate):
     h1 = soup.select_one("h1")
     if h1:
         data["title"] = clean(h1.get_text(" ", strip=True)) or data["title"]
-    if not data["description"]:
-        for selector in ("meta[property='og:description']", "meta[name='description']"):
-            node = soup.select_one(selector)
-            if node and node.get("content"):
-                data["description"] = clean(node["content"])
-                break
+
     og = soup.select_one("meta[property='og:image']")
     if og and og.get("content") and not data["cover"]:
         data["cover"] = urljoin(BASE, og["content"])
@@ -476,7 +482,6 @@ def parse_detail(html, candidate):
             authors.extend(clean(x.get_text(" ", strip=True)) for x in soup.select(selector))
         data["author"] = ", ".join(dict.fromkeys(x for x in authors if x)) or None
 
-    data["narrator"] = narrator_from_bookbeat(soup, description)
     data["publisher"] = (
         meta.get("Wydawca audiobooka")
         or meta.get("Wydawca e-booka")
@@ -495,32 +500,30 @@ def parse_detail(html, candidate):
         or data["isbn"]
     )
 
-    duration_candidates = []
+    duration = None
     for text in soup.stripped_strings:
         value = clean(text)
         if value and re.fullmatch(r"\d+\s*godz\.\s*\d+\s*min\.?(?:\s*)", value, re.I):
-            duration_candidates.append(value)
-    if duration_candidates:
-        data["duration"] = parse_duration(duration_candidates[0])
-
+            duration = parse_duration(value)
+            break
+    data["duration"] = duration
     data["genres"] = genres_from_bookbeat(soup) or list(dict.fromkeys(x for x in data["genres"] if x))
     data["series"], data["sequence"] = series_from_bookbeat(soup, flat)
 
-    for node in soup.find_all(attrs={"aria-label": True}):
-        if clean(node.get("aria-label")) in {"Język", "Języki"}:
-            value_node = node.find_next_sibling()
-            language = clean(value_node.get_text(" ", strip=True)) if value_node else None
-            if language and norm(language) not in {"polski", "polish", "pl"}:
-                data["language"] = None
-            break
-    data["genres"] = list(dict.fromkeys(x for x in data["genres"] if x))
     return data
 
 
-def needs_browser_detail(data):
-    # HTTP is kept as the fast path. Use the rendered DOM only when important
-    # BookBeat fields are missing from the server response.
-    return not all((data.get("description"), data.get("publisher"), data.get("isbn")))
+def needs_browser_fallback(data):
+    return any(not data.get(field) for field in ("description", "publisher", "publishedYear", "isbn"))
+
+
+def merge_missing(primary, fallback):
+    for key, value in fallback.items():
+        if not primary.get(key) and value:
+            primary[key] = value
+    if fallback.get("genres"):
+        primary["genres"] = list(dict.fromkeys((primary.get("genres") or []) + fallback["genres"]))
+    return primary
 
 
 def match_result(data, score):
@@ -552,51 +555,29 @@ async def bookbeat_search(query, author=""):
 
     candidates = await search_page(query)
     if author:
-        def candidate_rank(item):
-            title_score = similarity(item.get("title"), query)
-            author_score = similarity(item.get("authors", [""])[0] if item.get("authors") else "", author)
-            return title_score * 0.75 + author_score * 0.25
-        candidates.sort(key=candidate_rank, reverse=True)
+        candidates.sort(
+            key=lambda item: similarity(item.get("title"), query) * 0.75
+            + similarity((item.get("authors") or [""])[0], author) * 0.25,
+            reverse=True,
+        )
     else:
         candidates.sort(key=lambda item: similarity(item.get("title"), query), reverse=True)
-
     candidates = candidates[:20]
     print(f"[BookBeat] candidates to parse: {len(candidates)}")
 
     async def enrich(item):
         html = await fetch_html(item["url"])
-        try:
-            data = parse_detail(html, item) if html else None
-        except Exception as exc:
-            print(f"[BookBeat] HTTP detail parse failed: {item['url']} {type(exc).__name__}: {exc}")
-            data = None
-
-        if data is None or needs_browser_detail(data):
-            print(f"[BookBeat] detail metadata incomplete, using browser fallback: {item['url']}")
-            rendered = await browser_detail_page(item["url"])
-            if rendered:
-                try:
-                    browser_data = parse_detail(rendered, item)
-                    if data is None:
-                        data = browser_data
-                    else:
-                        # Rendered DOM wins for BookBeat-specific metadata because
-                        # it is the source of the visible detail page.
-                        for field in (
-                            "description", "publisher", "isbn", "narrator", "publishedYear",
-                            "duration", "genres", "series", "sequence", "cover",
-                        ):
-                            if browser_data.get(field):
-                                data[field] = browser_data[field]
-                        data["title"] = browser_data.get("title") or data.get("title")
-                        data["author"] = browser_data.get("author") or data.get("author")
-                        data["language"] = browser_data.get("language") or data.get("language")
-                except Exception as exc:
-                    print(f"[BookBeat] browser detail parse failed: {item['url']} {type(exc).__name__}: {exc}")
-
-        if not data:
+        if not html:
             return None
         try:
+            data = parse_detail(html, item)
+            if needs_browser_fallback(data):
+                print(f"[BookBeat] detail metadata incomplete, using browser fallback: {item['url']}")
+                browser_html = await browser_detail_page(item["url"])
+                if browser_html:
+                    rendered = parse_detail(browser_html, item)
+                    data = merge_missing(data, rendered)
+
             ts = similarity(data.get("title"), query)
             aa = similarity(data.get("author"), author) if author else 1.0
             score = ts * 0.75 + aa * 0.25 if author else ts
