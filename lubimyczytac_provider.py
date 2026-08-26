@@ -53,8 +53,11 @@ def similarity(a, b):
 
 
 def canonical(url):
+    # Do not force a trailing slash. LubimyCzytać audiobook URLs are served
+    # without it, e.g. /audiobook/5255783/siostry, while book URLs may use it.
     parsed = urlparse(url)
-    return urljoin(BASE, parsed.path.rstrip("/") + "/")
+    path = parsed.path.rstrip("/")
+    return urljoin(BASE, path + ("?" + parsed.query if parsed.query else ""))
 
 
 def url_title(url):
@@ -81,25 +84,24 @@ def parse_duration(value):
 def strip_html(value):
     if not value:
         return None
-    soup = BeautifulSoup(str(value), "html.parser")
-    return clean(soup.get_text(" ", strip=True))
+    return clean(BeautifulSoup(str(value), "html.parser").get_text(" ", strip=True))
 
 
 def parse_jsonld_scripts(soup):
     result = []
     for node in soup.select("script[type='application/ld+json']"):
-        raw = node.string or node.get_text()
         try:
-            data = json.loads(raw)
+            data = json.loads(node.string or node.get_text())
         except Exception:
             continue
         items = data if isinstance(data, list) else [data]
         for item in items:
-            if isinstance(item, dict):
-                result.append(item)
-                graph = item.get("@graph")
-                if isinstance(graph, list):
-                    result.extend(x for x in graph if isinstance(x, dict))
+            if not isinstance(item, dict):
+                continue
+            result.append(item)
+            graph = item.get("@graph")
+            if isinstance(graph, list):
+                result.extend(x for x in graph if isinstance(x, dict))
     return result
 
 
@@ -121,6 +123,8 @@ def first_nonempty(*values):
 
 def text_after_label(soup, labels):
     wanted = {norm(x).rstrip(":") for x in labels}
+
+    # Normal <dt>/<dd> metadata blocks.
     for dt in soup.select("dt"):
         label = norm(dt.get_text(" ", strip=True)).rstrip(":")
         if label in wanted:
@@ -129,26 +133,34 @@ def text_after_label(soup, labels):
                 value = clean(dd.get_text(" ", strip=True))
                 if value:
                     return value
-    # fallback for layouts that use generic divs
-    for node in soup.find_all(["div", "span", "p", "strong"]):
-        label = norm(node.get_text(" ", strip=True)).rstrip(":")
-        if label in wanted:
+
+    # Generic label/value layouts.
+    for node in soup.find_all(["div", "span", "p", "strong", "b", "th"]):
+        label_text = clean(node.get_text(" ", strip=True))
+        if norm(label_text).rstrip(":") in wanted:
             sibling = node.find_next_sibling()
             if sibling:
                 value = clean(sibling.get_text(" ", strip=True))
-                if value:
+                if value and norm(value).rstrip(":") not in wanted:
                     return value
+
+    # Some LC blocks contain "Label: value" in one element.
+    for node in soup.find_all(["div", "span", "p", "li"]):
+        text = clean(node.get_text(" ", strip=True))
+        if not text or ":" not in text:
+            continue
+        left, right = text.split(":", 1)
+        if norm(left).rstrip(":") in wanted:
+            right = clean(right)
+            if right:
+                return right
     return None
 
 
 def search_author_from_card(card):
-    selectors = [
-        ".book-card__author a",
-        ".book-card__author",
-        "a[href*='/autor/']",
-    ]
-    for selector in selectors:
-        vals = [clean(x) for x in card.select(selector)[0:10]]
+    if not card:
+        return []
+    for selector in [".book-card__author a", ".book-card__author", "a[href*='/autor/']"]:
         texts = [clean(x.get_text(" ", strip=True)) for x in card.select(selector)]
         texts = [x for x in texts if x]
         if texts:
@@ -157,6 +169,8 @@ def search_author_from_card(card):
 
 
 def card_cover(card):
+    if not card:
+        return None
     for img in card.select("img"):
         for attr in ("data-src", "data-original", "data-lazy-src", "src"):
             value = clean(img.get(attr))
@@ -183,22 +197,30 @@ async def get_http():
 
 async def fetch_html(url):
     client = await get_http()
-    last = None
-    for attempt in range(1, 4):
-        try:
-            response = await client.get(url, headers={"Referer": BASE + "/"})
-            if response.status_code == 429:
-                await asyncio.sleep(2 * attempt)
-                continue
-            if response.status_code in (403, 404):
-                return None, response.status_code
-            response.raise_for_status()
-            return response.text, response.status_code
-        except Exception as exc:
-            last = exc
-            await asyncio.sleep(0.5 * attempt)
-    print(f"[Lubimyczytać] HTTP failed: {url} {type(last).__name__}: {last}")
-    return None, None
+    # Try the exact canonical URL first. Only after a 404 do we try the
+    # alternate slash form because books and audiobooks use different forms.
+    candidates = [url.rstrip("/")]
+    if "/audiobook/" not in urlparse(url).path:
+        candidates.append(url.rstrip("/") + "/")
+    else:
+        candidates.append(url.rstrip("/") + "/")
+
+    for candidate_url in dict.fromkeys(candidates):
+        for attempt in range(1, 4):
+            try:
+                response = await client.get(candidate_url, headers={"Referer": BASE + "/"})
+                if response.status_code == 429:
+                    await asyncio.sleep(2 * attempt)
+                    continue
+                if response.status_code == 404:
+                    break
+                response.raise_for_status()
+                return response.text, response.status_code
+            except Exception as exc:
+                if attempt == 3:
+                    print(f"[Lubimyczytać] HTTP failed: {candidate_url} {type(exc).__name__}: {exc}")
+                await asyncio.sleep(0.5 * attempt)
+    return None, 404
 
 
 async def search_page(query, author, section, result_type):
@@ -212,8 +234,7 @@ async def search_page(query, author, section, result_type):
         return []
 
     soup = BeautifulSoup(html, "html.parser")
-    found = []
-    seen = set()
+    found, seen = [], set()
     for card in soup.select(".book-card--l"):
         if card.find_parent(class_=re.compile(r"promoted-offers")):
             continue
@@ -224,30 +245,26 @@ async def search_page(query, author, section, result_type):
         href = title_node.get("href")
         if not href:
             continue
-        href = canonical(urljoin(BASE, href))
         audio_link = card.select_one("a[href*='/audiobook/']")
         if result_type == "audiobook" and audio_link and audio_link.get("href"):
-            href = canonical(urljoin(BASE, audio_link.get("href")))
-        if not ("/ksiazka/" in urlparse(href).path or "/audiobook/" in urlparse(href).path):
+            href = audio_link.get("href")
+        href = canonical(urljoin(BASE, href))
+        path = urlparse(href).path
+        if "/ksiazka/" not in path and "/audiobook/" not in path:
             continue
-        actual_type = "audiobook" if "/audiobook/" in urlparse(href).path else result_type
+        actual_type = "audiobook" if "/audiobook/" in path else result_type
         key = (href.rstrip("/"), actual_type)
         if key in seen:
             continue
         seen.add(key)
-        authors = search_author_from_card(card)
-        # For audiobook search, the page itself is the authoritative type even if LC links to /ksiazka/.
-        if result_type == "audiobook" and "/audiobook/" not in urlparse(href).path:
-            actual_type = "audiobook"
         found.append({
             "url": href,
             "title": title or url_title(href),
-            "authors": authors,
+            "authors": search_author_from_card(card),
             "type": actual_type,
             "search_cover": card_cover(card),
         })
 
-    # The reference provider relies on the result cards. We only use direct product links as a very small fallback.
     if not found:
         selector = "a[href*='/audiobook/']" if result_type == "audiobook" else "a[href*='/ksiazka/']"
         for link in soup.select(selector)[:30]:
@@ -255,8 +272,7 @@ async def search_page(query, author, section, result_type):
             if not href:
                 continue
             href = canonical(urljoin(BASE, href))
-            actual_type = result_type
-            key = (href.rstrip("/"), actual_type)
+            key = (href.rstrip("/"), result_type)
             if key in seen:
                 continue
             seen.add(key)
@@ -264,9 +280,9 @@ async def search_page(query, author, section, result_type):
             found.append({
                 "url": href,
                 "title": clean(link.get_text(" ", strip=True)) or url_title(href),
-                "authors": search_author_from_card(parent) if parent else [],
-                "type": actual_type,
-                "search_cover": card_cover(parent) if parent else None,
+                "authors": search_author_from_card(parent),
+                "type": result_type,
+                "search_cover": card_cover(parent),
             })
 
     print(f"[Lubimyczytać] {section} '{query}' -> {len(found)} wyników")
@@ -293,17 +309,22 @@ def parse_detail_html(html, candidate):
         "url": candidate["url"],
     }
 
-    data["title"] = clean((soup.select_one("h1").get_text(" ", strip=True) if soup.select_one("h1") else None) or data["title"])
-    desc = soup.select_one("#book-description")
-    data["description"] = strip_html(desc.decode_contents()) if desc else None
-    if not data["description"]:
-        og_desc = soup.select_one("meta[property='og:description']")
-        data["description"] = clean(og_desc.get("content")) if og_desc else None
+    h1 = soup.select_one("h1")
+    data["title"] = clean(h1.get_text(" ", strip=True)) if h1 else data["title"]
 
-    cover = first_nonempty(
-        soup.select_one("a#js-lightboxCover"),
-        soup.select_one(".book-cover__link"),
-    )
+    desc = soup.select_one("#book-description")
+    if desc:
+        data["description"] = strip_html(desc.decode_contents())
+    if not data["description"]:
+        for selector in ["[itemprop='description']", "meta[property='og:description']", "meta[name='description']"]:
+            node = soup.select_one(selector)
+            if node:
+                value = node.get("content") if node.name == "meta" else node.get_text(" ", strip=True)
+                data["description"] = clean(value)
+                if data["description"]:
+                    break
+
+    cover = first_nonempty(soup.select_one("a#js-lightboxCover"), soup.select_one(".book-cover__link"))
     if cover:
         cover = cover.get("href")
     else:
@@ -315,14 +336,7 @@ def parse_detail_html(html, candidate):
     pub = soup.select_one("[data-ga-book-publishers]")
     if pub:
         data["publisher"] = clean(pub.get("data-ga-book-publishers"))
-    if not data["publisher"]:
-        for node in soup.select("span.book__txt"):
-            txt = clean(node.get_text(" ", strip=True))
-            if txt and "Wydawnictwo" in txt:
-                link = node.find("a")
-                data["publisher"] = clean(link.get_text(" ", strip=True) if link else txt.split(":", 1)[-1])
-                break
-    data["publisher"] = data["publisher"] or text_after_label(soup, ["Wydawnictwo", "Wydawca"])
+    data["publisher"] = data["publisher"] or text_after_label(soup, ["Wydawnictwo", "Wydawca", "Wydawnictwo audiobooka"])
 
     isbn = soup.select_one("meta[property='books:isbn']")
     data["isbn"] = clean(isbn.get("content")) if isbn else None
@@ -332,7 +346,7 @@ def parse_detail_html(html, candidate):
 
     data["language"] = text_after_label(soup, ["Język", "Języki"]) or "pol"
     data["publishedYear"] = parse_year(text_after_label(soup, ["Data pierwszego wydania", "Data wydania", "Data publikacji", "Data premiery"]))
-    data["narrator"] = text_after_label(soup, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator"])
+    data["narrator"] = text_after_label(soup, ["Lektor", "Lektorzy", "Czyta", "Czytają", "Narrator", "Nagranie czyta"])
     data["duration"] = parse_duration(text_after_label(soup, ["Długość", "Czas trwania", "Czas trwania audiobooka", "Czas czytania", "Czas"]))
 
     series_text = text_after_label(soup, ["Cykl", "Seria"])
@@ -352,8 +366,10 @@ def parse_detail_html(html, candidate):
         data["description"] = data["description"] or strip_html(obj.get("description"))
         data["isbn"] = data["isbn"] or clean(obj.get("isbn") or obj.get("productID"))
         image = obj.get("image") or obj.get("thumbnailUrl")
-        if isinstance(image, list): image = image[0] if image else None
-        if isinstance(image, dict): image = image.get("url")
+        if isinstance(image, list):
+            image = image[0] if image else None
+        if isinstance(image, dict):
+            image = image.get("url")
         data["cover"] = data["cover"] or (urljoin(BASE, str(image)) if image else None)
         if media_type == "audiobook":
             data["narrator"] = data["narrator"] or first_name(obj.get("readBy") or obj.get("reader") or obj.get("narrator"))
@@ -396,14 +412,13 @@ def score(data, query, author, candidate_authors):
 
 
 def to_match(data, value):
-    description = data.get("description") or None
     return {
         "title": data.get("title"),
         "author": data.get("author"),
         "narrator": data.get("narrator"),
         "publisher": data.get("publisher"),
         "publishedYear": data.get("publishedYear"),
-        "description": description,
+        "description": data.get("description") or None,
         "cover": data.get("cover"),
         "isbn": data.get("isbn"),
         "genres": None,
@@ -422,13 +437,11 @@ async def lubimyczytac_search(query, author=""):
         print(f"[Lubimyczytać] cache hit: {key}")
         return cached[1]
 
-    # Same architecture as lakafior provider: two fast HTTP searches, no Playwright for search or detail.
     books_task = search_page(query, author, "ksiazki", "book")
     audio_task = search_page(query, author, "audiobooki", "audiobook")
     books, audiobooks = await asyncio.gather(books_task, audio_task)
 
     matches = books + audiobooks
-    # preserve same URL when it appears in both sections, but keep the type from the section
     unique = {}
     for item in matches:
         unique[(item["url"].rstrip("/"), item["type"])] = item
@@ -437,9 +450,8 @@ async def lubimyczytac_search(query, author=""):
     for item in matches:
         item["similarity"] = score(item, query, author, item.get("authors"))
     matches.sort(key=lambda x: (x["similarity"], 1 if x["type"] == "audiobook" else 0), reverse=True)
-    matches = matches[:20]
+    matches = matches[:MAX_RESULTS]
 
-    # Match reference provider: fetch full metadata for the 20 ranked items in parallel.
     full = await asyncio.gather(*(detail_one(item) for item in matches))
     ranked = []
     for candidate, data in zip(matches, full):
