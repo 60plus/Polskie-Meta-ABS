@@ -1,36 +1,156 @@
-# Polskie Meta ABS
+# 🇵🇱 Polskie Meta ABS
 
-Jeden kontener Docker z providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/), przygotowanymi głównie z myślą o polskich książkach i audiobookach.
+### Polskie metadane dla Audiobookshelf — szybko, prosto i w jednym kontenerze.
 
-Projekt łączy cztery źródła w jednej instalacji:
+urlDocker Hub — 60plus/polskie-meta-abshttps://hub.docker.com/r/60plus/polskie-meta-abs
 
-| Provider | Źródło | Port |
-|---|---|---:|
-| **Storytel Polska** | https://www.storytel.com/pl | `3000` |
-| **Audioteka Polska** | https://audioteka.com/pl | `3001` |
-| **Lubimyczytać Polska** | https://lubimyczytac.pl | `3002` |
-| **BookBeat Polska** | https://www.bookbeat.com/pl | `3003` |
+**Polskie Meta ABS** dodaje do [Audiobookshelf](https://www.audiobookshelf.org/) polskie źródła metadanych dla książek i audiobooków.
 
-Dla Audiobookshelf każdy z nich jest osobnym źródłem metadanych.
+Zamiast ręcznie poprawiać okładki, autorów, opisy czy lektorów — instalujesz jeden kontener i dodajesz źródła w Audiobookshelf.
 
-## Co potrafi
+### 📚 Obsługiwane źródła
 
-- wyszukiwać książki i audiobooki po tytule oraz autorze;
-- dopasowywać właściwe wydanie do biblioteki;
-- pobierać okładki i opisy;
-- pobierać autorów i lektorów, jeśli są dostępni;
-- pobierać wydawcę, rok wydania i ISBN, jeśli są dostępne;
-- pobierać język, gatunek, serię i numer tomu, jeśli źródło je udostępnia;
-- pobierać czas trwania audiobooka, jeśli jest dostępny;
-- obsługiwać audiobooki i cykle Audioteki;
-- obsługiwać zarówno książki, jak i audiobooki z Lubimyczytać;
-- obsługiwać audiobooki z BookBeat.
+- 🇸🇪 **Storytel Polska**
+- 🎧 **Audioteka Polska**
+- 📖 **Lubimyczytać Polska**
+- 🎧 **BookBeat Polska**
 
-Priorytetem są polskie wydania i dane katalogowe.
+Providerzy obsługują wyszukiwanie po tytule i autorze oraz pobierają dostępne dane wydania, m.in. **okładkę, opis, autora, lektora, wydawcę, ISBN, rok wydania, serię, gatunek i czas trwania**.
 
-## Uruchomienie
+---
 
-Wymagany jest Docker oraz Docker Compose.
+## 🚀 Instalacja z Docker Hub — polecana
+
+Nie musisz klonować repozytorium ani budować obrazu samodzielnie.
+
+### 1. Pobierz najnowszy obraz
+
+```bash
+docker pull 60plus/polskie-meta-abs:latest
+```
+
+### 2. Uruchom kontener
+
+```bash
+docker run -d \
+  --name polskie-meta-abs \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  -p 3001:3001 \
+  -p 3002:3002 \
+  -p 3003:3003 \
+  60plus/polskie-meta-abs:latest
+```
+
+### 3. Sprawdź
+
+```bash
+docker ps
+```
+
+Logi:
+
+```bash
+docker logs -f polskie-meta-abs
+```
+
+Gotowe. 🎉
+
+---
+
+# 🎧 Dodanie do Audiobookshelf
+
+W Audiobookshelf przejdź do ustawień biblioteki / metadanych i dodaj **Custom Metadata Provider**.
+
+Dodaj źródła, których chcesz używać:
+
+| Źródło | URL providera |
+|---|---|
+| **Storytel Polska** | `http://IP_SERWERA:3000` |
+| **Audioteka Polska** | `http://IP_SERWERA:3001` |
+| **Lubimyczytać Polska** | `http://IP_SERWERA:3002` |
+| **BookBeat Polska** | `http://IP_SERWERA:3003` |
+
+Przykład dla serwera o adresie `192.168.1.100`:
+
+```text
+http://192.168.1.100:3002
+```
+
+### 💡 Jeśli Audiobookshelf działa na tym samym Docker hostcie
+
+Jeżeli Audiobookshelf i Polskie Meta ABS są w tej samej sieci Docker, najlepiej użyć nazwy kontenera zamiast adresu IP, np.:
+
+```text
+http://polskie-meta-abs:3002
+```
+
+---
+
+## ⭐ Dlaczego Polskie Meta ABS?
+
+### 🇵🇱 Skupione na polskim katalogu
+
+Źródła zostały dobrane przede wszystkim pod kątem polskich książek i audiobooków.
+
+### 🖼️ Lepsze okładki i opisy
+
+Providerzy pobierają dane bezpośrednio ze stron konkretnych wydań, a nie tylko z wyników wyszukiwania.
+
+### 🎙️ Audiobooki
+
+Dostępne są informacje takie jak lektor, czas trwania, wydawca czy ISBN — jeśli dane źródło je udostępnia.
+
+### 📚 Lubimyczytać
+
+Wyszukiwanie obejmuje zarówno książki, jak i audiobooki, dzięki czemu można znaleźć właściwe wydanie nawet wtedy, gdy występuje ono w obu katalogach.
+
+### 🎧 BookBeat
+
+Provider obsługuje również dane ukryte za **„Pokaż więcej”**, dzięki czemu może pobierać pełniejsze informacje z karty audiobooka.
+
+### 🐳 Jeden kontener
+
+Wszystkie źródła działają razem. Nie potrzebujesz osobnych kontenerów dla każdego providera.
+
+---
+
+# 🔄 Aktualizacja
+
+Pobierz najnowszy obraz:
+
+```bash
+docker pull 60plus/polskie-meta-abs:latest
+```
+
+Następnie odtwórz kontener:
+
+```bash
+docker stop polskie-meta-abs
+docker rm polskie-meta-abs
+
+docker run -d \
+  --name polskie-meta-abs \
+  --restart unless-stopped \
+  -p 3000:3000 \
+  -p 3001:3001 \
+  -p 3002:3002 \
+  -p 3003:3003 \
+  60plus/polskie-meta-abs:latest
+```
+
+Jeśli używasz Docker Compose, możesz również pobrać obraz i wykonać:
+
+```bash
+docker compose pull
+docker compose up -d
+```
+
+---
+
+# 🛠️ Instalacja z repozytorium
+
+Jeżeli wolisz budować obraz samodzielnie:
 
 ```bash
 git clone https://github.com/60plus/Polskie-Meta-ABS.git
@@ -38,138 +158,23 @@ cd Polskie-Meta-ABS
 docker compose up -d --build
 ```
 
-Sprawdzenie działania:
+---
+
+# 🔍 Diagnostyka
+
+Sprawdzenie kontenera:
 
 ```bash
-docker compose ps
+docker ps
 ```
 
 Logi:
 
 ```bash
-docker compose logs -f
+docker logs -f polskie-meta-abs
 ```
 
-Zatrzymanie:
-
-```bash
-docker compose down
-```
-
-## Konfiguracja w Audiobookshelf
-
-Dodaj każdy provider osobno jako niestandardowe źródło metadanych.
-
-### Storytel Polska
-
-```text
-Nazwa: Storytel Polska
-URL: http://SERWER:3000
-```
-
-### Audioteka Polska
-
-```text
-Nazwa: Audioteka Polska
-URL: http://SERWER:3001
-```
-
-### Lubimyczytać Polska
-
-```text
-Nazwa: Lubimyczytać Polska
-URL: http://SERWER:3002
-```
-
-### BookBeat Polska
-
-```text
-Nazwa: BookBeat Polska
-URL: http://SERWER:3003
-```
-
-Porty `3000`–`3003` są przeznaczone do użycia przez Audiobookshelf. Porty wewnętrzne kontenera nie muszą być wystawiane na hosta.
-
-## API
-
-Każdy provider udostępnia:
-
-```text
-GET /search
-```
-
-Parametry:
-
-- `query` — tytuł lub fragment tytułu;
-- `author` — opcjonalny autor.
-
-Wymagany jest nagłówek:
-
-```http
-Authorization: <dowolna-wartość>
-```
-
-Nie jest wymagane konto w serwisach źródłowych.
-
-## Lubimyczytać Polska
-
-Provider Lubimyczytać wyszukuje **zarówno książki, jak i audiobooki**.
-
-Dla jednego zapytania sprawdzane są oba katalogi, a następnie najlepsze wyniki są sprawdzane na stronach konkretnych produktów.
-
-Dzięki temu audiobook nie jest ograniczony wyłącznie do informacji widocznych na liście wyszukiwania.
-
-Provider pobiera między innymi tytuł, autora, lektora, opis, okładkę, wydawcę, ISBN, rok wydania, język, gatunek, serię, numer tomu i czas trwania, jeśli dane są dostępne.
-
-Lubimyczytać korzysta z bezpośredniego pobierania stron zamiast uruchamiania przeglądarki dla każdego wyniku. Książki i audiobooki są sprawdzane równolegle, a pełne dane są pobierane dopiero dla wybranych wyników.
-
-## Audioteka Polska
-
-Provider Audioteki obsługuje audiobooki oraz cykle/audioseriale.
-
-Dane są pobierane ze strony właściwego produktu, dzięki czemu wynik może zawierać pełniejszy opis i informacje o wydaniu.
-
-## BookBeat Polska
-
-Provider BookBeat obsługuje polski katalog BookBeat i wyszukuje audiobooki po tytule oraz autorze. Wyniki są następnie sprawdzane na stronie konkretnego produktu.
-
-Dane szczegółowe są pobierane z wyrenderowanej strony produktu, dzięki czemu provider może korzystać z metadanych, które nie są dostępne bezpośrednio w wynikach wyszukiwania.
-
-Obsługiwane są między innymi:
-
-- tytuł i autor;
-- lektor;
-- opis;
-- okładka;
-- wydawca;
-- rok publikacji;
-- ISBN audiobooka;
-- język;
-- gatunek;
-- seria i numer tomu;
-- czas trwania audiobooka.
-
-BookBeat może udostępniać ten sam tytuł jako audiobook i e-book. Provider dla Audiobookshelf korzysta z danych wydania audiobookowego, jeśli są dostępne, dzięki czemu np. czas trwania, ISBN i wydawca dotyczą właściwego wydania.
-
-### Rozwijanie pełnych metadanych
-
-Na stronie produktu BookBeat część dodatkowych informacji jest domyślnie ukryta za przyciskiem **„Pokaż więcej”**. Provider automatycznie rozwija tę sekcję przed odczytem metadanych.
-
-Obsługiwany jest również ekran zgody OneTrust. Provider próbuje zamknąć warstwę zgody przed dalszym przetwarzaniem strony, dzięki czemu overlay nie blokuje rozwijania metadanych.
-
-Nie jest wykonywane drugie kliknięcie **„Pokaż więcej”** — zapobiega to ponownemu zwinięciu sekcji i regresji przy kolejnym żądaniu do Audiobookshelf.
-
-Opis oraz szczegółowe informacje są pobierane ze strony produktu, a nie z samej listy wyszukiwania. Dzięki temu wynik może zawierać również pełniejsze informacje o obsadzie, lektorze, serii i wydaniu.
-
-## Dopasowanie
-
-Wyniki są oceniane na podstawie tytułu i autora, a następnie wybierane są najlepiej pasujące pozycje.
-
-W Lubimyczytać pozostawiane są zarówno książki, jak i audiobooki, ponieważ ten sam tytuł może mieć różne wydania i różne dane.
-
-## Sprawdzanie działania
-
-Health check każdego providera:
+Test providerów:
 
 ```bash
 curl http://localhost:3000/health
@@ -178,59 +183,22 @@ curl http://localhost:3002/health
 curl http://localhost:3003/health
 ```
 
-Przykładowa odpowiedź BookBeat:
+---
 
-```json
-{"status":"ok","provider":"bookbeat"}
-```
+# ❤️ Projekt
 
-## Struktura projektu
+**Polskie Meta ABS** jest projektem społecznościowym dla użytkowników Audiobookshelf, którzy chcą wygodniej korzystać z polskich książek i audiobooków.
 
-```text
-.
-├── Dockerfile
-├── compose.yml
-├── nginx.conf
-├── requirements.txt
-├── scraper.py
-├── audioteka_provider.py
-├── lubimyczytac_provider.py
-├── bookbeat_provider.py
-└── README.md
-```
+Jeżeli projekt jest dla Ciebie przydatny — ⭐ zostaw gwiazdkę na GitHubie i podziel się nim z innymi użytkownikami Audiobookshelf.
 
-### `scraper.py`
+urlGitHub — 60plus/Polskie-Meta-ABShttps://github.com/60plus/Polskie-Meta-ABS
 
-Provider Storytel Polska.
+urlDocker Hub — 60plus/polskie-meta-abshttps://hub.docker.com/r/60plus/polskie-meta-abs
 
-### `audioteka_provider.py`
+---
 
-Provider Audioteki Polska — wyszukiwanie oraz pobieranie metadanych audiobooków i cykli.
+## ⚠️ Uwaga
 
-### `lubimyczytac_provider.py`
+Źródła zewnętrzne mogą zmieniać swoje strony i sposób udostępniania danych. W takim przypadku provider może wymagać aktualizacji.
 
-Provider Lubimyczytać Polska — wyszukiwanie książek i audiobooków oraz pobieranie ich metadanych.
-
-### `bookbeat_provider.py`
-
-Provider BookBeat Polska — wyszukiwanie oraz pobieranie metadanych audiobooków ze stron produktów, z obsługą zgody OneTrust i rozwijania ukrytych metadanych.
-
-### `nginx.conf`
-
-Łączy cztery providery w jeden kontener i udostępnia je na osobnych portach.
-
-### `Dockerfile` i `compose.yml`
-
-Konfiguracja potrzebna do uruchomienia całego projektu w Dockerze.
-
-## Dodawanie kolejnych źródeł
-
-Nowy provider powinien mieć własne wyszukiwanie, pobierać dane właściwego produktu i zwracać je w formacie obsługiwanym przez Audiobookshelf.
-
-Nie trzeba tworzyć osobnego kontenera dla każdego źródła.
-
-## Uwagi
-
-Serwisy źródłowe mogą zmieniać wygląd i sposób udostępniania danych. W takim przypadku odpowiedni provider może wymagać aktualizacji.
-
-Projekt korzysta z publicznie dostępnych danych katalogowych. Prawa do opisów, okładek i pozostałych materiałów pozostają przy ich właścicielach.
+Projekt korzysta z publicznie dostępnych danych katalogowych. Prawa do opisów, okładek i pozostałych materiałów należą do ich właścicieli.
