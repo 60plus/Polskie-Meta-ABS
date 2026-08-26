@@ -1,45 +1,38 @@
-# Polskie Meta dla Audiobookshelf
+# Polskie Meta ABS
 
-Jeden kontener z providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/) opartymi o polskie katalogi audiobooków.
+Jeden kontener z niezależnymi providerami metadanych dla [Audiobookshelf](https://www.audiobookshelf.org/), skoncentrowanymi na polskich katalogach audiobooków.
 
-Obecnie obsługiwane są:
+## Obsługiwane źródła
 
-- **Storytel Polska**
-- **Audioteka Polska**
+| Provider | Źródło | Port |
+|---|---|---:|
+| Storytel Polska | `https://www.storytel.com/pl` | `3000` |
+| Audioteka Polska | `https://audioteka.com/pl` | `3001` |
 
-Projekt korzysta z jednego wspólnego środowiska Playwright/Chromium. Każdy provider ma własną logikę wyszukiwania i ekstrakcji metadanych, ale nie wymaga osobnego kontenera.
+Oba providery działają w **jednym kontenerze Docker** i korzystają ze wspólnego środowiska Playwright/Chromium.
 
-## Obsługiwane providery
+## Dlaczego Playwright?
 
-| Provider | Katalog | Port | Endpoint |
-|---|---|---:|---|
-| Storytel Polska | `storytel.com/pl` | `3000` | `/search?provider=storytel` |
-| Audioteka Polska | `audioteka.com/pl` | `3001` | `/search?provider=audioteka` |
+Zarówno Storytel, jak i Audioteka korzystają z nowoczesnych stron internetowych renderowanych przez JavaScript. Zwykłe pobranie HTML może nie zawierać wyników, które użytkownik widzi w przeglądarce.
 
-## Jak to działa
-
-Storytel i Audioteka korzystają z nowoczesnych stron renderowanych przez JavaScript. Dlatego zwykłe pobranie HTML nie zawsze daje te same wyniki, które są widoczne w przeglądarce.
-
-Providery wykorzystują wspólny Chromium uruchamiany przez Playwright:
+Provider uruchamia więc Chromium i wykonuje strony tak, jak robi to normalna przeglądarka:
 
 ```text
 Audiobookshelf
       │
-      ▼
-Polskie Meta dla ABS
+      ├── :3000 ──► Storytel Polska
       │
-      ├──────────────► Storytel Polska
-      │                    port 3000
-      │
-      └──────────────► Audioteka Polska
-                           port 3001
+      └── :3001 ──► Audioteka Polska
+                         │
+                  wspólny kontener
+                  Playwright + Chromium
 ```
 
-Wyniki są następnie zamieniane na format metadanych odpowiedni dla Audiobookshelf.
+Każdy katalog ma własny scraper, selektory i mechanizm dopasowania. Wspólne są infrastruktura, przeglądarka, cache i format odpowiedzi dla Audiobookshelf.
 
 ## Pobierane metadane
 
-Providery starają się zwracać najważniejsze informacje o audiobooku:
+Provider zwraca informacje dostępne w katalogu danego źródła, w szczególności:
 
 - tytuł;
 - autor;
@@ -53,21 +46,23 @@ Providery starają się zwracać najważniejsze informacje o audiobooku:
 - czas trwania w minutach;
 - gatunki;
 - seria i numer w serii;
-- wynik podobieństwa.
+- wynik dopasowania.
 
-Źródłem danych są bezpośrednio polskie katalogi Storytel i Audioteka. Priorytetem są **polskie wydania i polskie dane katalogowe**.
+Priorytetem są **polskie wydania i polskie dane katalogowe**.
 
 ## Uruchomienie
 
 Wymagany jest Docker z Docker Compose.
 
 ```bash
-git clone https://github.com/60plus/Storytel.pl-ADB.git
-cd Storytel.pl-ADB
+git clone https://github.com/60plus/Polskie-Meta-ABS.git
+cd Polskie-Meta-ABS
 docker compose up -d --build
 ```
 
-Sprawdzenie kontenera:
+Jeżeli repozytorium lokalnie ma jeszcze starą nazwę, po zmianie nazwy na GitHubie można używać dotychczasowego katalogu roboczego — nie ma potrzeby ponownego klonowania.
+
+Sprawdzenie:
 
 ```bash
 docker compose ps
@@ -85,52 +80,68 @@ Zatrzymanie:
 docker compose down
 ```
 
-## Storytel Polska
+## Porty
 
-Provider korzysta z polskiego wyszukiwania Storytel oraz z indywidualnych stron książek.
-
-Adres providera:
+### Storytel Polska
 
 ```text
-http://adres-serwera:3000
+http://SERWER:3000
 ```
 
-Przykład:
+### Audioteka Polska
+
+```text
+http://SERWER:3001
+```
+
+Porty są tylko wejściami do dwóch niezależnych providerów. Wewnątrz kontenera działa jeden serwer aplikacji i jeden wspólny Chromium.
+
+## Test Storytel
 
 ```bash
 curl -s \
   -H 'Authorization: test' \
-  'http://localhost:3000/search?provider=storytel&query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
+  'http://localhost:3000/search?query=Wywy%C5%BCszenie%20Horusa&author=Dan%20Abnett'
 ```
 
-## Audioteka Polska
-
-Provider korzysta z polskiego katalogu Audioteka i z tego samego środowiska Chromium, które jest używane przez Storytel.
-
-Adres providera:
-
-```text
-http://adres-serwera:3001
-```
-
-Przykład:
+## Test Audioteka
 
 ```bash
 curl -s \
   -H 'Authorization: test' \
-  'http://localhost:3001/search?provider=audioteka&query=Mazurski%20przekr%C4%99t'
+  'http://localhost:3001/search?query=Mazurski%20przekr%C4%99t'
 ```
 
-Parser Audioteki jest przygotowany również na pozycje będące audioserialami i seriami, dlatego nie ogranicza się wyłącznie do klasycznych książek.
+## Health check
 
-## Wspólne API
+```bash
+curl http://localhost:3000/health
+curl http://localhost:3001/health
+```
 
-### `GET /search`
+Przykładowa odpowiedź:
+
+```json
+{"status":"ok","provider":"storytel"}
+```
+
+lub:
+
+```json
+{"status":"ok","provider":"audioteka"}
+```
+
+## API wyszukiwania
+
+Oba providery udostępniają ten sam endpoint:
+
+```text
+GET /search
+```
 
 Parametry:
 
-- `provider` — `storytel` albo `audioteka`;
-- `query` — wymagany tytuł;
+- `query` — tytuł lub fragment tytułu;
 - `author` — opcjonalny autor.
 
 Wymagany jest nagłówek:
@@ -139,29 +150,31 @@ Wymagany jest nagłówek:
 Authorization: <dowolna-wartość>
 ```
 
+Nie jest wymagane logowanie do konta Storytel ani Audioteka.
+
 Przykładowa odpowiedź:
 
 ```json
 {
   "matches": [
     {
-      "title": "...",
-      "author": "...",
-      "narrator": "...",
-      "publisher": "...",
-      "publishedYear": "2024",
+      "title": "Wywyższenie Horusa",
+      "author": "Dan Abnett",
+      "narrator": "Filip Kosior",
+      "publisher": "Copernicus Corporation",
+      "publishedYear": "2022",
       "description": "...",
       "cover": "https://...",
-      "isbn": "...",
+      "isbn": "9788386758937",
       "genres": ["..."],
       "series": [
         {
-          "series": "...",
+          "series": "Herezja Horusa",
           "sequence": "1"
         }
       ],
       "language": "pol",
-      "duration": 696,
+      "duration": 757,
       "type": "audiobook",
       "similarity": 1.0
     }
@@ -169,92 +182,96 @@ Przykładowa odpowiedź:
 }
 ```
 
-`duration` jest podawane w minutach.
-
-### `GET /health`
-
-```bash
-curl http://localhost:3000/health
-```
-
-Odpowiedź:
-
-```json
-{"status":"ok"}
-```
-
-### `GET /providers`
-
-```bash
-curl -s \
-  -H 'Authorization: test' \
-  'http://localhost:3000/providers'
-```
-
-Zwraca listę dostępnych providerów.
+`duration` jest zwracane w minutach.
 
 ## Audiobookshelf
 
-W Audiobookshelf możesz dodać każdy provider jako osobny niestandardowy provider metadanych.
+Dodaj każdy provider osobno jako niestandardowy provider metadanych.
 
 ### Storytel Polska
 
 ```text
 Nazwa: Storytel Polska
-URL: http://adres-serwera:3000
+URL: http://SERWER:3000
 ```
 
 ### Audioteka Polska
 
 ```text
 Nazwa: Audioteka Polska
-URL: http://adres-serwera:3001
+URL: http://SERWER:3001
 ```
 
-Niestandardowe providery metadanych dodaje się w ustawieniach Audiobookshelf. citeturn883065search0
+Dzięki osobnym portom Audiobookshelf traktuje je jako dwa niezależne źródła, mimo że fizycznie działają w jednym kontenerze.
 
-## Struktura projektu
+## Architektura projektu
 
 ```text
 .
 ├── Dockerfile
 ├── compose.yml
+├── nginx.conf
 ├── requirements.txt
 ├── scraper.py
 └── README.md
 ```
 
-## Architektura
+### `scraper.py`
 
-Jeden kontener współdzieli:
+Wspólna aplikacja FastAPI zawierająca oba providery oraz wspólną obsługę Playwright/Chromium.
 
+### `nginx.conf`
+
+Rozdziela ruch na podstawie portu:
+
+```text
+3000 → Storytel Polska
+3001 → Audioteka Polska
+```
+
+Oba porty przekazują żądania do tej samej aplikacji FastAPI.
+
+### `Dockerfile`
+
+Buduje jeden obraz zawierający:
+
+- Python;
 - FastAPI;
+- Uvicorn;
 - Playwright;
 - Chromium;
-- cache;
-- mechanizmy normalizacji i rankingu.
+- Nginx.
 
-Każdy provider ma własne:
+## Dopasowanie wyników
 
-- adresy wyszukiwania;
-- selektory stron;
-- parser metadanych;
-- zasady dopasowania wyników.
+Wyszukiwanie nie polega wyłącznie na prostym porównaniu tekstu.
 
-Dzięki temu dodanie kolejnego polskiego źródła nie wymaga uruchamiania kolejnego kontenera.
+Provider bierze pod uwagę między innymi:
 
-## Dodawanie kolejnego providera
+- podobieństwo tytułu;
+- podobieństwo autora, jeśli został podany;
+- polski język wydania;
+- dane ze strony konkretnego produktu.
+
+Dzięki temu rekomendacje i przypadkowe pozycje o podobnym tytule mają mniejszą szansę zostać zwrócone jako właściwe dopasowanie.
+
+## Dodawanie kolejnych polskich katalogów
+
+Projekt został przygotowany jako baza pod kolejne źródła metadanych.
 
 Nowy provider powinien:
 
-1. wyszukiwać pozycje w swoim katalogu;
-2. pobierać stronę szczegółową;
-3. wyciągać potrzebne metadane;
-4. oceniać dopasowanie tytułu i autora;
-5. zwracać wynik w formacie Audiobookshelf.
+1. korzystać ze wspólnego Playwright/Chromium;
+2. posiadać własny mechanizm wyszukiwania;
+3. pobierać stronę szczegółową produktu;
+4. wyciągać tylko metadane potrzebne Audiobookshelf;
+5. stosować własne reguły dopasowania;
+6. zwracać ten sam format `matches`.
+
+Kolejne źródła mogą dostać własne porty, bez tworzenia kolejnego kontenera.
 
 ## Uwagi
 
-Struktura stron Storytel i Audioteka może się zmieniać. W przypadku zmiany HTML, routingu lub sposobu renderowania strony odpowiedni parser może wymagać aktualizacji.
+Strony Storytel i Audioteka mogą zmieniać HTML, routing lub sposób renderowania wyników. W takim przypadku odpowiedni scraper może wymagać aktualizacji.
 
-Projekt pobiera dane dostępne publicznie na stronach dostawców. Prawa do treści, opisów, okładek i innych materiałów źródłowych pozostają przy ich właścicielach.
+Projekt korzysta z publicznie dostępnych danych katalogowych. Prawa do opisów, okładek, treści i innych materiałów pobieranych ze stron pozostają przy ich właścicielach.
