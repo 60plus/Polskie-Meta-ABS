@@ -5,11 +5,10 @@ WORKDIR /app
 COPY requirements.txt ./
 RUN pip install --no-cache-dir -r requirements.txt
 
-COPY scraper.py ./
+COPY scraper.py audioteka_scraper.py audioteka_app.py ./
 
 ENV PYTHONUNBUFFERED=1
-ENV PORT=3000
 
-EXPOSE 3000
+EXPOSE 3000 3001
 
-CMD ["uvicorn", "scraper:app", "--host", "0.0.0.0", "--port", "3000"]
+CMD ["sh", "-c", "uvicorn scraper:app --host 0.0.0.0 --port 3000 & uvicorn audioteka_app:app --host 0.0.0.0 --port 3001 & wait"]
