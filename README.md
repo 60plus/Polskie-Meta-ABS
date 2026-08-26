@@ -1,13 +1,13 @@
 # 🇵🇱 Polskie Meta ABS
 
-### Polskie metadane dla Audiobookshelf — szybko, prosto i w jednym kontenerze.
+### Polskie metadane dla Audiobookshelf - szybko, prosto i w jednym kontenerze.
 
 [![Docker Hub](https://img.shields.io/docker/v/60plus/polskie-meta-abs?label=Docker%20Hub&logo=docker)](https://hub.docker.com/r/60plus/polskie-meta-abs)
 [![GitHub](https://img.shields.io/github/stars/60plus/Polskie-Meta-ABS?style=flat&logo=github)](https://github.com/60plus/Polskie-Meta-ABS)
 
 **Polskie Meta ABS** dodaje do [Audiobookshelf](https://www.audiobookshelf.org/) polskie źródła metadanych dla książek i audiobooków.
 
-Zamiast ręcznie poprawiać okładki, autorów, opisy czy lektorów — instalujesz jeden kontener i dodajesz źródła w Audiobookshelf.
+Zamiast ręcznie poprawiać okładki, autorów, opisy czy lektorów - instalujesz jeden kontener i dodajesz źródła w Audiobookshelf.
 
 ### 📚 Obsługiwane źródła
 
@@ -20,7 +20,7 @@ Providerzy obsługują wyszukiwanie po tytule i autorze oraz pobierają dostępn
 
 ---
 
-## 🚀 Instalacja z Docker Hub — polecana
+## 🚀 Instalacja z Docker Hub - polecana
 
 Nie musisz klonować repozytorium ani budować obrazu samodzielnie.
 
@@ -100,7 +100,7 @@ Providerzy pobierają dane bezpośrednio ze stron konkretnych wydań, a nie tylk
 
 ### 🎙️ Audiobooki
 
-Dostępne są informacje takie jak lektor, czas trwania, wydawca czy ISBN — jeśli dane źródło je udostępnia.
+Dostępne są informacje takie jak lektor, czas trwania, wydawca czy ISBN - jeśli dane źródło je udostępnia.
 
 ### 📚 Lubimyczytać
 
@@ -129,7 +129,6 @@ Następnie odtwórz kontener:
 ```bash
 docker stop polskie-meta-abs
 docker rm polskie-meta-abs
-
 docker run -d \
   --name polskie-meta-abs \
   --restart unless-stopped \
@@ -190,7 +189,7 @@ curl http://localhost:3003/health
 
 **Polskie Meta ABS** jest projektem społecznościowym dla użytkowników Audiobookshelf, którzy chcą wygodniej korzystać z polskich książek i audiobooków.
 
-Jeżeli projekt jest dla Ciebie przydatny — ⭐ zostaw gwiazdkę na GitHubie i podziel się nim z innymi użytkownikami Audiobookshelf.
+Jeżeli projekt jest dla Ciebie przydatny - ⭐ zostaw gwiazdkę na GitHubie i podziel się nim z innymi użytkownikami Audiobookshelf.
 
 - GitHub: https://github.com/60plus/Polskie-Meta-ABS
 - Docker Hub: https://hub.docker.com/r/60plus/polskie-meta-abs
