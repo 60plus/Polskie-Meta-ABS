@@ -204,7 +204,6 @@ async def get_context():
 
 
 async def open_page(page, url, wait=400):
-    # Audioteka keeps background requests open; networkidle caused long hangs.
     await page.goto(url, wait_until="domcontentloaded", timeout=15000)
     await page.wait_for_timeout(wait)
     for text in ("Akceptuję", "Zgadzam się", "Zaakceptuj"):
@@ -294,42 +293,54 @@ def rank_urls(urls, query):
     return sorted([u for u in unique if not is_blocked_url(u)], key=rank)
 
 
-async def first_selector_text(page, selectors, min_length=1):
-    """Return the first useful visible text matching one of the supplied selectors."""
-    for selector in selectors:
-        try:
-            locator = page.locator(selector).first
-            if await locator.count():
-                value = clean(await locator.inner_text())
-                if value and len(value) >= min_length:
-                    return value
-        except Exception:
-            pass
-    return None
-
-
 async def extract_description(page, series_page):
-    # Audioteka uses different dedicated description containers for products
-    # and series. Do not use generic body text: it can pick up reviews, footer,
-    # recommendations, or other unrelated copy.
+    """Extract only Audioteka's real description block, never generic body text."""
     if series_page:
         selectors = [
             "[class*='paragraph_description_']",
             "[class^='paragraph_description_']",
         ]
     else:
+        # Current Audioteka audiobook pages expose the description with a
+        # stable id. Keep the exact selector first; CSS module class names are
+        # deliberately only fallbacks because their hash changes over time.
         selectors = [
+            "#audiobook-description",
+            "div#audiobook-description",
             ".audiobook-description",
             "[class*='audiobook-description']",
         ]
-    return await first_selector_text(page, selectors, min_length=20)
+
+    for selector in selectors:
+        try:
+            locator = page.locator(selector).first
+            if not await locator.count():
+                continue
+
+            # The description can be inserted after DOMContentLoaded. Give
+            # this one element a short, targeted wait instead of making the
+            # whole page wait for networkidle.
+            try:
+                await locator.wait_for(state="attached", timeout=2500)
+            except Exception:
+                pass
+
+            # text_content() works even when the section is collapsed behind
+            # "Czytaj więcej". The button is outside #audiobook-description.
+            value = clean(await locator.text_content())
+            if value and len(value) >= 20:
+                print(f"[Audioteka] description: selector={selector} chars={len(value)}")
+                return value
+        except Exception as exc:
+            print(f"[Audioteka] description selector failed {selector}: {type(exc).__name__}")
+    print(f"[Audioteka] description: NOT FOUND series={series_page}")
+    return None
 
 
 async def extract_published_year(page, lines, jsonld_year=None):
     if jsonld_year:
         return jsonld_year
 
-    # Prefer explicit metadata attributes/meta tags before looking at rendered labels.
     meta_selectors = [
         "meta[itemprop='datePublished']",
         "meta[property='article:published_time']",
@@ -354,18 +365,12 @@ async def extract_published_year(page, lines, jsonld_year=None):
         except Exception:
             pass
 
-    # Audioteka has used several visible labels over time.
     value = extract_line_value(
         lines,
         [
-            "Data publikacji",
-            "Data wydania",
-            "Data premiery",
-            "Rok publikacji",
-            "Rok wydania",
-            "Rok premiery",
-            "Premiera",
-            "Wydano",
+            "Data publikacji", "Data wydania", "Data premiery",
+            "Rok publikacji", "Rok wydania", "Rok premiery",
+            "Premiera", "Wydano",
         ],
     )
     return parse_year(value)
@@ -451,7 +456,6 @@ async def parse_product(page, url, query, author="", enrich_series=False):
     if data["title"] in {"Cały sezon już dostępny!", "Cały sezon już dostępny"}:
         data["title"] = query or extract_title_from_url(url)
 
-    # Use Audioteka's dedicated description blocks first, then JSON-LD/OG fallback.
     dedicated_description = await extract_description(page, series_page)
     data["description"] = dedicated_description or data["description"] or og_description
     data["cover"] = data["cover"] or og_image
@@ -541,7 +545,7 @@ async def audioteka_search(query, author=""):
             if data.get("title"):
                 data["similarity"] = round(score(data, query, author), 4)
                 parsed.append(data)
-                print(f"[Audioteka] parsed: {data['title']} / {data.get('author')} series={data.get('is_series')} score={data['similarity']:.3f} url={url}")
+                print(f"[Audioteka] parsed: {data['title']} / {data.get('author')} series={data.get('is_series')} score={data['similarity']:.3f} url={url} description={len(data.get('description') or '')}chars year={data.get('publishedYear')}")
         except Exception as exc:
             print(f"[Audioteka] parse failed {url}: {type(exc).__name__}: {exc}")
         finally:
