@@ -158,21 +158,11 @@ async def fetch_html(url):
 async def cover_url_status(url):
     client = await get_http()
     try:
-        response = await client.head(
-            url,
-            headers={"Referer": BASE + "/"},
-            follow_redirects=True,
-            timeout=4.0,
-        )
+        response = await client.head(url, headers={"Referer": BASE + "/"}, follow_redirects=True, timeout=4.0)
         if response.status_code in {200, 204, 206}:
             return url
         if response.status_code == 405:
-            response = await client.get(
-                url,
-                headers={"Referer": BASE + "/", "Range": "bytes=0-0"},
-                follow_redirects=True,
-                timeout=4.0,
-            )
+            response = await client.get(url, headers={"Referer": BASE + "/", "Range": "bytes=0-0"}, follow_redirects=True, timeout=4.0)
             if response.status_code in {200, 206}:
                 return url
     except Exception:
@@ -181,10 +171,8 @@ async def cover_url_status(url):
 
 
 async def resolve_cover(candidates):
-    """Resolve high -> medium -> small concurrently, then choose the best available."""
     if not candidates:
         return None
-    # Do all checks concurrently so cover fallback cannot make the ABS search slow.
     results = await asyncio.gather(*(cover_url_status(url) for url in candidates), return_exceptions=True)
     for url, result in zip(candidates, results):
         if result == url:
@@ -200,8 +188,6 @@ def cover_candidates_from_page(soup):
         if urls:
             break
 
-    # Virtualo's data-interchange currently exposes medium/small. Generate
-    # high from the same CDN path and explicitly prefer high > medium > small.
     expanded = []
     for url in urls:
         url = url.rstrip("\]),")
@@ -321,8 +307,62 @@ def links_after_label(soup, *labels):
     return []
 
 
+def narrator_links_after_label(soup):
+    """Extract every narrator/reader link from the Virtualo 'Czyta/Lektor' row.
+
+    Virtualo has used more than one DOM layout. In some versions the label and
+    links are siblings rather than children of the same parent, so the old
+    parent-only selector could return just the first narrator or none at all.
+    Narrator profile URLs consistently use the /...-lNNN/ form, which lets us
+    safely identify all narrator links without confusing the author link.
+    """
+    label = label_node(soup, "Czyta") or label_node(soup, "Lektor")
+    if not label:
+        return []
+
+    def extract(scope):
+        if not scope:
+            return []
+        values = []
+        for a in scope.select("a[href]"):
+            href = a.get("href") or ""
+            text = clean(a.get_text(" ", strip=True))
+            if text and re.search(r"-l\d+(?:/)?(?:$|[?#])", urlparse(urljoin(BASE, href)).path, re.I):
+                values.append(text)
+        return list(dict.fromkeys(values))
+
+    # First try the smallest useful containers.
+    for scope in (label.parent, label.parent.parent if label.parent else None):
+        values = extract(scope)
+        if values:
+            return values
+
+    # Then inspect following siblings. This matches the current Virtualo DOM
+    # where 'Czyta:' is followed by a separate element containing all links.
+    current = label
+    for _ in range(4):
+        current = current.find_next_sibling()
+        if not current:
+            break
+        values = extract(current)
+        if values:
+            return values
+
+    # Last fallback: find narrator profile links in the nearest product/details
+    # container, stopping before unrelated page sections.
+    for ancestor in label.parents:
+        if getattr(ancestor, "name", None) not in {"div", "section", "article", "main"}:
+            continue
+        values = extract(ancestor)
+        if values:
+            return values
+        if ancestor.name == "main":
+            break
+
+    return []
+
+
 def description_from_page(soup):
-    # Prefer the actual product description over Virtualo's short SEO/meta text.
     labels = re.compile(r"^Opis(?: audiobooka| e-booka| ebooka)?$", re.I)
     for node in soup.find_all(string=labels):
         parent = node.parent
@@ -344,16 +384,13 @@ def description_from_page(soup):
             result = clean(" ".join(chunks))
             if result and len(result) >= 80:
                 return result
-
-        # If the description is nested inside the tab container, use the
-        # nearest meaningful block without truncating it to og:description.
         for ancestor in parent.parents:
             if getattr(ancestor, "name", None) not in {"div", "section", "article"}:
                 continue
             text = clean(ancestor.get_text(" ", strip=True))
             if text and len(text) >= 120 and len(text) < 12000:
                 text = re.sub(r"^Opis(?: audiobooka| e-booka| ebooka)?\s*", "", text, flags=re.I)
-                return clean_product_title(text) if False else clean(text)
+                return clean(text)
 
     for selector in ("[itemprop='description']", "meta[property='og:description']", "meta[name='description']"):
         node = soup.select_one(selector)
@@ -396,8 +433,12 @@ def parse_detail(html, candidate):
         data["author"] = ", ".join(dict.fromkeys(x for x in authors if x)) or None
 
     data["publisher"] = label_value(soup, "Wydawnictwo", "Wydawca")
-    narrators = links_after_label(soup, "Czyta", "Lektor")
-    data["narrator"] = ", ".join(narrators) if narrators else label_value(soup, "Czyta", "Lektor")
+    narrators = narrator_links_after_label(soup)
+    if narrators:
+        data["narrator"] = ", ".join(narrators)
+    else:
+        data["narrator"] = label_value(soup, "Czyta", "Lektor")
+
     data["publishedYear"] = parse_year(label_value(soup, "Data wydania", "Data publikacji"))
     data["duration"] = parse_duration(label_value(soup, "Czas", "Czas trwania"))
 
@@ -525,8 +566,6 @@ async def virtualo_search(query, author=""):
     enriched.sort(key=lambda x: x[0], reverse=True)
     top = [(score, data) for score, data in enriched if score >= 0.55][:MAX_RESULTS]
 
-    # Resolve covers only for results that will actually be returned. This is
-    # deliberately after ranking so cover probing cannot delay ABS unnecessarily.
     cover_results = await asyncio.gather(
         *(resolve_cover(data.get("coverCandidates") or []) for score, data in top),
         return_exceptions=True,
