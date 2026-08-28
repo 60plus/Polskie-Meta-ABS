@@ -15,6 +15,7 @@ Zamiast ręcznie poprawiać okładki, autorów, opisy czy lektorów - instalujes
 - 🇵🇱 **Audioteka Polska**
 - 🇵🇱 **Lubimyczytać Polska**
 - 🇵🇱 **BookBeat Polska**
+- 🇵🇱 **Virtualo Polska**
 
 Providerzy obsługują wyszukiwanie po tytule i autorze oraz pobierają dostępne dane wydania, m.in. **okładkę, opis, autora, lektora, wydawcę, ISBN, rok wydania, serię, gatunek i czas trwania**.
 
@@ -40,6 +41,7 @@ docker run -d \
   -p 3001:3001 \
   -p 3002:3002 \
   -p 3003:3003 \
+  -p 3004:3004 \
   60plus/polskie-meta-abs:latest
 ```
 
@@ -71,11 +73,12 @@ Dodaj źródła, których chcesz używać:
 | **Audioteka Polska** | `http://IP_SERWERA:3001` |
 | **Lubimyczytać Polska** | `http://IP_SERWERA:3002` |
 | **BookBeat Polska** | `http://IP_SERWERA:3003` |
+| **Virtualo Polska** | `http://IP_SERWERA:3004` |
 
 Przykład dla serwera o adresie `192.168.1.100`:
 
 ```text
-http://192.168.1.100:3002
+http://192.168.1.100:3004
 ```
 
 ### 💡 Jeśli Audiobookshelf działa na tym samym Docker hostcie
@@ -83,7 +86,7 @@ http://192.168.1.100:3002
 Jeżeli Audiobookshelf i Polskie Meta ABS są w tej samej sieci Docker, najlepiej użyć nazwy kontenera zamiast adresu IP, np.:
 
 ```text
-http://polskie-meta-abs:3002
+http://polskie-meta-abs:3004
 ```
 
 ---
@@ -109,6 +112,10 @@ Wyszukiwanie obejmuje zarówno książki, jak i audiobooki, dzięki czemu można
 ### 🎧 BookBeat
 
 Provider obsługuje również dane ukryte za **„Pokaż więcej”**, dzięki czemu może pobierać pełniejsze informacje z karty audiobooka.
+
+### 🛒 Virtualo
+
+Virtualo udostępnia zarówno **audiobooki, jak i e-booki**. Provider wyszukuje oba typy wydań i pobiera dane bezpośrednio z karty produktu, w tym opis, autora, lektora, wydawcę, ISBN, datę wydania, kategorię, język i czas trwania audiobooka.
 
 ### 🐳 Jeden kontener
 
@@ -136,6 +143,7 @@ docker run -d \
   -p 3001:3001 \
   -p 3002:3002 \
   -p 3003:3003 \
+  -p 3004:3004 \
   60plus/polskie-meta-abs:latest
 ```
 
@@ -181,6 +189,7 @@ curl http://localhost:3000/health
 curl http://localhost:3001/health
 curl http://localhost:3002/health
 curl http://localhost:3003/health
+curl http://localhost:3004/health
 ```
 
 ---
