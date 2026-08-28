@@ -7,7 +7,7 @@ from difflib import SequenceMatcher
 from urllib.parse import quote_plus, urljoin, urlparse
 
 import httpx
-from bs4 import BeautifulSoup, NavigableString
+from bs4 import BeautifulSoup
 from fastapi import FastAPI, Header, HTTPException, Query
 from fastapi.responses import JSONResponse
 
@@ -15,6 +15,7 @@ app = FastAPI(title="Virtualo Polska Metadata Provider")
 BASE = "https://virtualo.pl"
 CACHE_TTL = 600
 MAX_RESULTS = 10
+SEARCH_CANDIDATES = 10
 _http = None
 _lock = asyncio.Lock()
 _cache = {}
@@ -52,18 +53,10 @@ def similarity(a, b):
 
 
 def clean_product_title(value):
-    """Remove Virtualo's format suffix while keeping the real book title."""
     value = clean(value)
     if not value:
         return None
-    # Examples: "Operacja Mir - audiobook", "Operacja Mir - Audiobook (Książka audio MP3)",
-    # "Operacja Mir - ebook" and similar Virtualo product labels.
-    value = re.sub(
-        r"\s*[-–—|]\s*(?:audiobook|ebook|e-book)\b.*$",
-        "",
-        value,
-        flags=re.I,
-    )
+    value = re.sub(r"\s*[-–—|]\s*(?:audiobook|ebook|e-book)\b.*$", "", value, flags=re.I)
     value = re.sub(r"\s*\((?:audiobook|ebook|e-book)\)\s*$", "", value, flags=re.I)
     return clean(value)
 
@@ -139,7 +132,7 @@ async def get_http():
                 headers=HEADERS,
                 follow_redirects=True,
                 timeout=httpx.Timeout(20.0, connect=10.0),
-                limits=httpx.Limits(max_connections=16, max_keepalive_connections=8),
+                limits=httpx.Limits(max_connections=32, max_keepalive_connections=16),
             )
         return _http
 
@@ -162,72 +155,74 @@ async def fetch_html(url):
     return None
 
 
-async def url_exists(url):
-    """Check a CDN cover URL without downloading the whole image."""
+async def cover_url_status(url):
     client = await get_http()
     try:
-        response = await client.head(url, headers={"Referer": BASE + "/"}, follow_redirects=True)
+        response = await client.head(
+            url,
+            headers={"Referer": BASE + "/"},
+            follow_redirects=True,
+            timeout=4.0,
+        )
         if response.status_code in {200, 204, 206}:
-            return True
+            return url
         if response.status_code == 405:
             response = await client.get(
                 url,
                 headers={"Referer": BASE + "/", "Range": "bytes=0-0"},
                 follow_redirects=True,
+                timeout=4.0,
             )
-            return response.status_code in {200, 206}
+            if response.status_code in {200, 206}:
+                return url
     except Exception:
         pass
-    return False
+    return None
 
 
 async def resolve_cover(candidates):
-    """Prefer high > medium > small and use the first reachable Virtualo CDN image."""
-    for url in candidates:
-        if await url_exists(url):
+    """Resolve high -> medium -> small concurrently, then choose the best available."""
+    if not candidates:
+        return None
+    # Do all checks concurrently so cover fallback cannot make the ABS search slow.
+    results = await asyncio.gather(*(cover_url_status(url) for url in candidates), return_exceptions=True)
+    for url, result in zip(candidates, results):
+        if result == url:
             return url
-    return candidates[-1] if candidates else None
+    return candidates[-1]
 
 
 def cover_candidates_from_page(soup):
-    """Read Virtualo's data-interchange image list and add a high-res candidate."""
-    candidates = []
-
+    urls = []
     for image in soup.select("img[data-interchange]"):
         raw = image.get("data-interchange") or ""
-        urls = re.findall(r"https?://[^\s,\]]+", raw)
-        for url in urls:
-            url = url.rstrip("]),")
-            if url not in candidates:
-                candidates.append(url)
-
-        # Virtualo currently publishes medium/small in data-interchange.
-        # Try the same file in /high/ first, then keep the advertised sizes.
-        for url in list(candidates):
-            if "/covers/" in url and re.search(r"/covers/(?:medium|small)/", url):
-                high = re.sub(r"/covers/(?:medium|small)/", "/covers/high/", url, count=1)
-                if high not in candidates:
-                    candidates.insert(0, high)
-
-        if candidates:
+        urls.extend(re.findall(r"https?://[^\s,\]]+", raw))
+        if urls:
             break
 
-    # Also support plain src/srcset/og:image if data-interchange is unavailable.
-    if not candidates:
+    # Virtualo's data-interchange currently exposes medium/small. Generate
+    # high from the same CDN path and explicitly prefer high > medium > small.
+    expanded = []
+    for url in urls:
+        url = url.rstrip("\]),")
+        if "/covers/medium/" in url or "/covers/small/" in url:
+            high = re.sub(r"/covers/(?:medium|small)/", "/covers/high/", url, count=1)
+            if high not in expanded:
+                expanded.append(high)
+        if url not in expanded:
+            expanded.append(url)
+
+    if not expanded:
         for image in soup.select("img[src], img[srcset]"):
-            for attr in ("src", "srcset"):
-                value = image.get(attr)
-                if not value:
-                    continue
-                if attr == "srcset":
-                    value = value.split(",")[0].strip().split()[0]
-                if value.startswith("http") and "/covers/" in value:
-                    candidates.append(value)
-                    break
-            if candidates:
+            value = image.get("src") or image.get("srcset")
+            if not value:
+                continue
+            if " " in value:
+                value = value.split(",")[0].strip().split()[0]
+            if value.startswith("http") and "/covers/" in value:
+                expanded.append(value)
                 break
 
-    # Ensure order is explicitly high -> medium -> small.
     def rank(url):
         if "/covers/high/" in url:
             return 0
@@ -237,7 +232,7 @@ def cover_candidates_from_page(soup):
             return 2
         return 3
 
-    return list(dict.fromkeys(sorted(candidates, key=rank)))
+    return list(dict.fromkeys(sorted(expanded, key=rank)))
 
 
 def card_container(link):
@@ -327,56 +322,39 @@ def links_after_label(soup, *labels):
 
 
 def description_from_page(soup):
-    """Extract the complete Virtualo description tab instead of the short meta description."""
-    patterns = (
-        r"^opis(?:\s+(?:audiobooka|e-booka|ebooka))?$",
-        r"^opis$",
-    )
-
-    for text_node in soup.find_all(string=True):
-        text = clean(text_node)
-        if not text or not any(re.match(pattern, text, re.I) for pattern in patterns):
+    # Prefer the actual product description over Virtualo's short SEO/meta text.
+    labels = re.compile(r"^Opis(?: audiobooka| e-booka| ebooka)?$", re.I)
+    for node in soup.find_all(string=labels):
+        parent = node.parent
+        if not parent:
             continue
-
-        start = text_node.parent
         chunks = []
-        started = False
-        seen_title = False
-
-        # Walk the document after the description tab label. Stop at the next
-        # metadata section so unrelated page content is never appended.
-        for element in start.next_elements:
-            if isinstance(element, NavigableString):
-                value = clean(str(element))
-                if not value:
-                    continue
-                normalized = norm(value)
-                if normalized in {"szczegoly", "opis audiobooka", "opis ebooka", "opis e booka"}:
-                    if normalized == "szczegoly" and not chunks:
-                        continue
-                    continue
-                if normalized.startswith("cena virtualo") or normalized == "bestsellery":
-                    break
-                if normalized.startswith("kategoria:") or normalized.startswith("zabezpieczenie:"):
-                    break
-                if normalized.startswith("isbn:") or normalized.startswith("rozmiar pliku:"):
-                    break
-                if not started:
-                    started = True
-                if not seen_title and len(value) < 180:
-                    # The product title is repeated at the beginning of the tab.
-                    if re.search(r"\s[-–—]\s*(?:audiobook|ebook|e-book)\b", value, re.I):
-                        seen_title = True
-                        continue
-                chunks.append(value)
-
-        # Avoid returning a huge accidental page fragment.
+        current = parent
+        for _ in range(8):
+            current = current.find_next_sibling()
+            if not current:
+                break
+            text = clean(current.get_text(" ", strip=True))
+            if not text:
+                continue
+            if re.match(r"^(Szczegóły|Informacje|Pliki|Opinie|Cena)\b", text, re.I):
+                break
+            chunks.append(text)
         if chunks:
-            result = clean(" ".join(dict.fromkeys(chunks)))
-            if len(result or "") >= 80:
+            result = clean(" ".join(chunks))
+            if result and len(result) >= 80:
                 return result
 
-    # Fallbacks only when the dedicated description tab could not be found.
+        # If the description is nested inside the tab container, use the
+        # nearest meaningful block without truncating it to og:description.
+        for ancestor in parent.parents:
+            if getattr(ancestor, "name", None) not in {"div", "section", "article"}:
+                continue
+            text = clean(ancestor.get_text(" ", strip=True))
+            if text and len(text) >= 120 and len(text) < 12000:
+                text = re.sub(r"^Opis(?: audiobooka| e-booka| ebooka)?\s*", "", text, flags=re.I)
+                return clean_product_title(text) if False else clean(text)
+
     for selector in ("[itemprop='description']", "meta[property='og:description']", "meta[name='description']"):
         node = soup.select_one(selector)
         if node:
@@ -395,7 +373,6 @@ def parse_detail(html, candidate):
         "publisher": None,
         "publishedYear": None,
         "description": description_from_page(soup),
-        "cover": None,
         "coverCandidates": cover_candidates_from_page(soup),
         "isbn": None,
         "duration": None,
@@ -422,7 +399,7 @@ def parse_detail(html, candidate):
     narrators = links_after_label(soup, "Czyta", "Lektor")
     data["narrator"] = ", ".join(narrators) if narrators else label_value(soup, "Czyta", "Lektor")
     data["publishedYear"] = parse_year(label_value(soup, "Data wydania", "Data publikacji"))
-    data["duration"] = parse_duration(label_value(soup, "Czas"))
+    data["duration"] = parse_duration(label_value(soup, "Czas", "Czas trwania"))
 
     category = label_value(soup, "Kategoria", "Kategorie")
     if category:
@@ -451,14 +428,19 @@ def parse_detail(html, candidate):
         data["publisher"] = data["publisher"] or clean(publisher)
         data["isbn"] = data["isbn"] or clean(obj.get("isbn") or obj.get("productID"))
         data["publishedYear"] = data["publishedYear"] or parse_year(obj.get("datePublished"))
+        image = obj.get("image") or obj.get("thumbnailUrl")
+        if isinstance(image, list):
+            image = image[0] if image else None
+        if isinstance(image, dict):
+            image = image.get("url")
+        if image and not data["coverCandidates"]:
+            data["coverCandidates"] = [urljoin(BASE, str(image))]
         genre = obj.get("genre")
         if isinstance(genre, list):
             data["genres"].extend(clean(x) for x in genre if clean(x))
         elif genre:
             data["genres"].append(clean(genre))
 
-    # Only use JSON-LD/og:image as a fallback. Virtualo's data-interchange
-    # contains the actual cover variants and is preferred.
     if not data["coverCandidates"]:
         og = soup.select_one("meta[property='og:image']")
         if og and og.get("content"):
@@ -511,7 +493,7 @@ async def virtualo_search(query, author=""):
         ),
         reverse=True,
     )
-    candidates = candidates[:20]
+    candidates = candidates[:SEARCH_CANDIDATES]
     print(f"[Virtualo] candidates to parse: {len(candidates)}")
 
     async def enrich(item):
@@ -520,8 +502,6 @@ async def virtualo_search(query, author=""):
             return None
         try:
             data = parse_detail(detail_html, item)
-            data["cover"] = await resolve_cover(data.get("coverCandidates") or [])
-
             title_score = similarity(data.get("title"), query)
             author_score = similarity(data.get("author"), author) if author else 1.0
             score = title_score * 0.75 + author_score * 0.25 if author else title_score
@@ -531,7 +511,7 @@ async def virtualo_search(query, author=""):
                 f"[Virtualo] detail: {data.get('title')} / {data.get('author')} score={score:.3f} "
                 f"type={data.get('type')} narrator={data.get('narrator')} publisher={data.get('publisher')} "
                 f"year={data.get('publishedYear')} isbn={data.get('isbn')} duration={data.get('duration')} "
-                f"genres={data.get('genres')} cover={data.get('cover')} url={data.get('url')}"
+                f"genres={data.get('genres')} url={data.get('url')}"
             )
             return score, data
         except Exception as exc:
@@ -539,11 +519,23 @@ async def virtualo_search(query, author=""):
             return None
 
     enriched = []
-    for i in range(0, len(candidates), 8):
-        enriched.extend(x for x in await asyncio.gather(*(enrich(x) for x in candidates[i:i + 8])) if x)
+    for i in range(0, len(candidates), 5):
+        enriched.extend(x for x in await asyncio.gather(*(enrich(x) for x in candidates[i:i + 5])) if x)
 
     enriched.sort(key=lambda x: x[0], reverse=True)
-    final = [match_result(data, score) for score, data in enriched if score >= 0.55][:MAX_RESULTS]
+    top = [(score, data) for score, data in enriched if score >= 0.55][:MAX_RESULTS]
+
+    # Resolve covers only for results that will actually be returned. This is
+    # deliberately after ranking so cover probing cannot delay ABS unnecessarily.
+    cover_results = await asyncio.gather(
+        *(resolve_cover(data.get("coverCandidates") or []) for score, data in top),
+        return_exceptions=True,
+    )
+    final = []
+    for (score, data), cover in zip(top, cover_results):
+        data["cover"] = cover if isinstance(cover, str) else None
+        final.append(match_result(data, score))
+
     result = {"matches": final}
     print("[Virtualo] final:", " | ".join(f"{x['title']}/{x['author']} [{x['similarity']:.3f}]" for x in final))
     if final:
